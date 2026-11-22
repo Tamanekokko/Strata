@@ -130,6 +130,7 @@ struct DenseMat {
 
 struct GpuWeightStore {
     std::vector<void*> gpu_allocs;
+    std::vector<std::pair<int, void*>> peer_gpu_allocs;
     std::vector<void*> host_allocs;
     std::vector<void*> host_pinned_allocs;
     std::vector<void*> q8_packed_keys;
@@ -140,6 +141,16 @@ struct GpuWeightStore {
     void free_store() {
         for (void* p : q8_packed_keys) K::native_q8_0_packed_unregister(p);
         for (void* p : gpu_allocs) cudaFree(p);
+        if (!peer_gpu_allocs.empty()) {
+            int cur_dev = 0;
+            (void) cudaGetDevice(&cur_dev);
+            for (const auto& kv : peer_gpu_allocs) {
+                (void) cudaSetDevice(kv.first);
+                (void) cudaFree(kv.second);
+            }
+            (void) cudaSetDevice(cur_dev);
+            peer_gpu_allocs.clear();
+        }
         for (void* p : host_pinned_allocs) cudaFreeHost(p);
         for (void* p : host_allocs) std::free(p);
         q8_packed_keys.clear();
@@ -296,9 +307,15 @@ struct PhysLayer {
     int n_slots = 0;
     int32_t* d_slot_of = nullptr;        // [n_expert] in VRAM
     uint32_t* d_hits = nullptr;          // [n_expert] GPU routing frequency counter (even when n_slots == ne)
-    std::vector<int32_t> slot_of;        // [n_expert] on host (-1 = CPU)
+    std::vector<int32_t> slot_of;        // [n_expert] on host (-1 = not on primary GPU)
     std::vector<int32_t> exp_in_slot;    // [n_slots]
     std::vector<double> score;           // [n_expert]
+
+    // Optional peer GPU MoE experts (--peer-device)
+    uint8_t* peer_blobs = nullptr;       // [peer_slots][stride] on peer GPU
+    int peer_slots = 0;
+    int32_t* peer_d_slot_of = nullptr;   // [n_expert] on peer GPU (-1 = not on peer GPU)
+    std::vector<int32_t> peer_slot_of;   // [n_expert] on host
 };
 
 struct Model : GpuWeightStore {
@@ -861,6 +878,132 @@ struct Engine {
     std::vector<cudaGraphExec_t> layer_pre_graph;
     bool core_all_gpu = false;
     bool graph_oom = false;
+    bool has_any_peer = false;
+
+    struct PeerState {
+        int dev = -1;
+        int primary_dev = 0;
+        bool p2p = false;
+        int reserve_mib = 512;
+        int balance_mode = 0;
+        cudaStream_t st = nullptr;
+        cudaEvent_t ev_done = nullptr;
+
+        float* x_norm = nullptr;
+        void* xq = nullptr;
+        uint16_t* act_f16 = nullptr;
+        int32_t* ids = nullptr;
+        float* ewts = nullptr;
+        unsigned long long* grp_ptr = nullptr;
+        int32_t* grp_start = nullptr;
+        int32_t* n_groups = nullptr;
+        int32_t* ent_dst = nullptr;
+        int32_t* ent_tok = nullptr;
+        void* escr = nullptr;
+        float* eparts = nullptr;
+        float* sum_out = nullptr;
+
+        float* h_x = nullptr;
+        int32_t* h_ids = nullptr;
+        float* h_ewts = nullptr;
+        float* h_sum = nullptr;
+
+        float* d_peer_sum = nullptr;
+
+        void destroy() {
+            if (d_peer_sum) { (void) cudaSetDevice(primary_dev); (void) cudaFree(d_peer_sum); d_peer_sum = nullptr; }
+            if (h_x) { (void) cudaFreeHost(h_x); h_x = nullptr; }
+            if (h_ids) { (void) cudaFreeHost(h_ids); h_ids = nullptr; }
+            if (h_ewts) { (void) cudaFreeHost(h_ewts); h_ewts = nullptr; }
+            if (h_sum) { (void) cudaFreeHost(h_sum); h_sum = nullptr; }
+            if (dev >= 0) {
+                (void) cudaSetDevice(dev);
+                if (x_norm) cudaFree(x_norm);
+                if (xq) cudaFree(xq);
+                if (act_f16) cudaFree(act_f16);
+                if (ids) cudaFree(ids);
+                if (ewts) cudaFree(ewts);
+                if (grp_ptr) cudaFree(grp_ptr);
+                if (grp_start) cudaFree(grp_start);
+                if (n_groups) cudaFree(n_groups);
+                if (ent_dst) cudaFree(ent_dst);
+                if (ent_tok) cudaFree(ent_tok);
+                if (escr) cudaFree(escr);
+                if (eparts) cudaFree(eparts);
+                if (sum_out) cudaFree(sum_out);
+                if (ev_done) cudaEventDestroy(ev_done);
+                if (st) cudaStreamDestroy(st);
+                (void) cudaSetDevice(primary_dev);
+            }
+            x_norm = nullptr; xq = nullptr; act_f16 = nullptr;
+            ids = nullptr; ewts = nullptr; grp_ptr = nullptr; grp_start = nullptr;
+            n_groups = nullptr; ent_dst = nullptr; ent_tok = nullptr;
+            escr = nullptr; eparts = nullptr; sum_out = nullptr;
+            ev_done = nullptr; st = nullptr; dev = -1; p2p = false;
+        }
+
+        bool init(int prim_dev, int peer_dev, int resv_mib, int bal, int tmax, const Hparams& hp, std::string& err) {
+            destroy();
+            if (peer_dev < 0 || peer_dev == prim_dev) return true;
+            int ndev = 0;
+            if (cudaGetDeviceCount(&ndev) != cudaSuccess || peer_dev >= ndev) {
+                err = "invalid --peer-device " + std::to_string(peer_dev) + " (device count=" + std::to_string(ndev) + ")";
+                return false;
+            }
+            primary_dev = prim_dev;
+            dev = peer_dev;
+            reserve_mib = std::max(128, resv_mib);
+            balance_mode = bal;
+
+            int can01 = 0, can10 = 0;
+            (void) cudaDeviceCanAccessPeer(&can01, primary_dev, dev);
+            (void) cudaDeviceCanAccessPeer(&can10, dev, primary_dev);
+            if (can01 && can10 && std::getenv("STRATA_PEER_NO_P2P") == nullptr) {
+                bool ok01 = false, ok10 = false;
+                (void) cudaSetDevice(primary_dev);
+                cudaError_t e0 = cudaDeviceEnablePeerAccess(dev, 0);
+                if (e0 == cudaSuccess || e0 == cudaErrorPeerAccessAlreadyEnabled) ok01 = true;
+                else (void) cudaGetLastError();
+                (void) cudaSetDevice(dev);
+                cudaError_t e1 = cudaDeviceEnablePeerAccess(primary_dev, 0);
+                if (e1 == cudaSuccess || e1 == cudaErrorPeerAccessAlreadyEnabled) ok10 = true;
+                else (void) cudaGetLastError();
+                p2p = (ok01 && ok10);
+            }
+
+            const int64_t N = hp.n_embd;
+            const int64_t max_ent = (int64_t) tmax * hp.n_expert_used;
+            const size_t q8_bytes = (size_t) tmax * ((size_t) N / 32) * 36;
+            const size_t escr_bytes = K::native_expert_scratch_bytes(max_ent, hp.n_ff);
+
+            CK(cudaSetDevice(dev));
+            CK(cudaStreamCreate(&st));
+            CK(cudaEventCreateWithFlags(&ev_done, cudaEventDisableTiming));
+            CK(cudaMalloc(&x_norm, (size_t) tmax * (size_t) N * sizeof(float)));
+            CK(cudaMalloc(&xq, q8_bytes));
+            CK(cudaMalloc(&act_f16, (size_t) tmax * (size_t) N * sizeof(__half)));
+            CK(cudaMalloc(&ids, (size_t) max_ent * sizeof(int32_t)));
+            CK(cudaMalloc(&ewts, (size_t) max_ent * sizeof(float)));
+            CK(cudaMalloc(&grp_ptr, (size_t) hp.n_expert * sizeof(unsigned long long)));
+            CK(cudaMalloc(&grp_start, (size_t) (hp.n_expert + 1) * sizeof(int32_t)));
+            CK(cudaMalloc(&n_groups, sizeof(int32_t)));
+            CK(cudaMalloc(&ent_dst, (size_t) max_ent * sizeof(int32_t)));
+            CK(cudaMalloc(&ent_tok, (size_t) max_ent * sizeof(int32_t)));
+            CK(cudaMalloc(&escr, escr_bytes));
+            CK(cudaMalloc(&eparts, (size_t) max_ent * (size_t) N * sizeof(float)));
+            CK(cudaMalloc(&sum_out, (size_t) tmax * (size_t) N * sizeof(float)));
+
+            CK(cudaSetDevice(primary_dev));
+            CK(cudaMalloc(&d_peer_sum, (size_t) tmax * (size_t) N * sizeof(float)));
+            if (!p2p) {
+                CK(cudaHostAlloc(&h_x, (size_t) tmax * (size_t) N * sizeof(float), cudaHostAllocDefault));
+                CK(cudaHostAlloc(&h_ids, (size_t) max_ent * sizeof(int32_t), cudaHostAllocDefault));
+                CK(cudaHostAlloc(&h_ewts, (size_t) max_ent * sizeof(float), cudaHostAllocDefault));
+                CK(cudaHostAlloc(&h_sum, (size_t) tmax * (size_t) N * sizeof(float), cudaHostAllocDefault));
+            }
+            return true;
+        }
+    } peer;
 
     // Prefix cache checkpoint (stores conv_hist + circular SWA KV state in host RAM; full-attn KV stays append-only on GPU)
     struct StateCheckpoint {
@@ -950,6 +1093,7 @@ struct Engine {
     }
 
     ~Engine() {
+        peer.destroy();
         if (core_graph) cudaGraphExecDestroy(core_graph);
         if (verify_core_graph) cudaGraphExecDestroy(verify_core_graph);
         for (auto g : layer_pre_graph) if (g) cudaGraphExecDestroy(g);
@@ -1714,15 +1858,18 @@ struct Engine {
         const int N = (int) hp.n_embd, Kp = (int) hp.n_expert_used;
         const int n_ent = T * Kp;
         const bool has_gpu = L.n_slots > 0;
-        const bool need_cpu = L.n_slots < hp.n_expert;
+        const bool has_peer = (L.peer_slots > 0 && peer.dev >= 0);
+        const bool need_cpu = (L.n_slots + L.peer_slots) < hp.n_expert;
         const bool is_q5 = (L.L.gu_type == 13);
-        const bool fused_rg = (!need_cpu && has_gpu && !pre_routed_t1 && T >= 1 && T <= 8 &&
+        const bool fused_rg = (!need_cpu && !has_peer && has_gpu && !pre_routed_t1 && T >= 1 && T <= 8 &&
                                hp.n_expert <= 128 && Kp <= 16);
 
         const auto tp_moe_r0 = Clock::now();
         if (!pre_routed_t1) {
             if (need_cpu && T == 1 && !pp_streaming) {
                 CK(cudaMemcpyAsync(h_h, x_norm, (size_t) N * sizeof(float), cudaMemcpyDeviceToHost, st));
+            } else if (has_peer && !need_cpu && !peer.p2p && T == 1 && !xq_ready_in) {
+                CK(cudaMemcpyAsync(peer.h_x, x_norm, (size_t) N * sizeof(float), cudaMemcpyDeviceToHost, st));
             }
             project_f32(x_norm, L.ffn_gate_inp, router_logits, T, hp.n_expert, N);
             if (fused_rg) {
@@ -1802,6 +1949,113 @@ struct Engine {
             }
             const int n4 = ((N & 3) == 0) ? (N >> 2) : N;
             k_combine_experts<<<dim3((unsigned) ((n4 + 255) / 256), (unsigned) T), 256, 0, st>>>(eparts, ewts, moe_raw, N, Kp);
+            if (prof) { CK(cudaStreamSynchronize(st)); p_moe_gpu_ms += ms_since(tp_moe_r0); }
+            return;
+        }
+
+        if (has_peer && !need_cpu) {
+            // Primary + Peer GPU parallel MoE execution (zero CPU fallback!)
+            const size_t x_bytes = (size_t) T * (size_t) N * sizeof(float);
+            const size_t q8_bytes = (size_t) T * ((size_t) N / 32) * 36;
+            const size_t f16_bytes = (size_t) T * (size_t) N * sizeof(uint16_t);
+            const size_t ids_bytes = (size_t) n_ent * sizeof(int32_t);
+            const size_t ewts_bytes = (size_t) n_ent * sizeof(float);
+            // Fast path: ship already-quantized Q8_1 (T<16, 72% smaller) or FP16 (T>=16, 50% smaller) directly
+            const bool send_q8 = (!try_wmma && (N & 31) == 0);
+            const bool send_f16 = (try_wmma && f16_ready_in && L.L.had_block == 0 && !L.L.gu_nib &&
+                                   (L.L.n_embd % 256 == 0) && (L.L.n_ff % 128 == 0));
+            if (send_q8) ensure_q8();
+            if (!peer.p2p) {
+                if (send_q8) CK(cudaMemcpyAsync(peer.h_x, xq, q8_bytes, cudaMemcpyDeviceToHost, st));
+                else if (send_f16) CK(cudaMemcpyAsync(peer.h_x, act_bf16, f16_bytes, cudaMemcpyDeviceToHost, st));
+                else if (T > 1) CK(cudaMemcpyAsync(peer.h_x, x_norm, x_bytes, cudaMemcpyDeviceToHost, st));
+                CK(cudaMemcpyAsync(peer.h_ids, ids, ids_bytes, cudaMemcpyDeviceToHost, st));
+                CK(cudaMemcpyAsync(peer.h_ewts, ewts, ewts_bytes, cudaMemcpyDeviceToHost, st));
+            }
+            CK(cudaEventRecord(ev_route, st));
+
+            // Launch primary GPU MoE work immediately on primary stream while peer runs concurrently
+            if (has_gpu) {
+                k_group_experts<<<1, 128, 0, st>>>(ids, L.d_slot_of, L.d_blobs, L.stride, n_ent, (int) hp.n_expert, L.n_slots,
+                                                   grp_ptr, grp_start, n_groups, ent_dst, ent_tok, Kp);
+                const int64_t est_gpu = ((int64_t) n_ent * L.n_slots + hp.n_expert - 1) / hp.n_expert;
+                run_grouped(grp_ptr, std::min<int64_t>(n_ent, L.n_slots), est_gpu);
+            }
+
+            // Launch peer GPU MoE work on peer stream
+            CK(cudaSetDevice(peer.dev));
+            CK(cudaStreamWaitEvent(peer.st, ev_route, 0));
+            if (peer.p2p) {
+                if (send_q8) CK(cudaMemcpyPeerAsync(peer.xq, peer.dev, xq, peer.primary_dev, q8_bytes, peer.st));
+                else if (send_f16) CK(cudaMemcpyPeerAsync(peer.act_f16, peer.dev, act_bf16, peer.primary_dev, f16_bytes, peer.st));
+                else CK(cudaMemcpyPeerAsync(peer.x_norm, peer.dev, x_norm, peer.primary_dev, x_bytes, peer.st));
+                CK(cudaMemcpyPeerAsync(peer.ids, peer.dev, ids, peer.primary_dev, ids_bytes, peer.st));
+                CK(cudaMemcpyPeerAsync(peer.ewts, peer.dev, ewts, peer.primary_dev, ewts_bytes, peer.st));
+            } else {
+                if (send_q8) CK(cudaMemcpyAsync(peer.xq, peer.h_x, q8_bytes, cudaMemcpyHostToDevice, peer.st));
+                else if (send_f16) CK(cudaMemcpyAsync(peer.act_f16, peer.h_x, f16_bytes, cudaMemcpyHostToDevice, peer.st));
+                else CK(cudaMemcpyAsync(peer.x_norm, peer.h_x, x_bytes, cudaMemcpyHostToDevice, peer.st));
+                CK(cudaMemcpyAsync(peer.ids, peer.h_ids, ids_bytes, cudaMemcpyHostToDevice, peer.st));
+                CK(cudaMemcpyAsync(peer.ewts, peer.h_ewts, ewts_bytes, cudaMemcpyHostToDevice, peer.st));
+            }
+            k_group_experts<<<1, 128, 0, peer.st>>>(peer.ids, L.peer_d_slot_of, L.peer_blobs, L.stride, n_ent,
+                                                    (int) hp.n_expert, L.peer_slots,
+                                                    peer.grp_ptr, peer.grp_start, peer.n_groups, peer.ent_dst, peer.ent_tok, Kp);
+            const int64_t est_peer = ((int64_t) n_ent * L.peer_slots + hp.n_expert - 1) / hp.n_expert;
+            const int64_t cap_peer = std::min<int64_t>(n_ent, L.peer_slots);
+            bool peer_wmma_ok = false;
+            if (try_wmma) {
+                if (!send_f16) {
+                    const int64_t tot = (int64_t) T * N;
+                    k_f32_to_f16<<<(unsigned) ((tot + 255) / 256), 256, 0, peer.st>>>(peer.x_norm, peer.act_f16, tot);
+                }
+                peer_wmma_ok = K::native_expert_grouped_wmma(L.L, peer.grp_ptr, peer.grp_start, peer.n_groups,
+                                                             peer.ent_dst, peer.ent_tok, cap_peer, n_ent,
+                                                             peer.act_f16, peer.escr, peer.eparts, peer.st, est_peer);
+            }
+            if (!peer_wmma_ok) {
+                if (!send_q8) {
+                    if (send_f16) {
+                        // Rare fallback if WMMA declined after send_f16: copy x_norm and quantize
+                        if (peer.p2p) CK(cudaMemcpyPeerAsync(peer.x_norm, peer.dev, x_norm, peer.primary_dev, x_bytes, peer.st));
+                        else {
+                            CK(cudaSetDevice(peer.primary_dev));
+                            CK(cudaMemcpyAsync(peer.h_x, x_norm, x_bytes, cudaMemcpyDeviceToHost, st));
+                            CK(cudaEventRecord(ev_route, st));
+                            CK(cudaSetDevice(peer.dev));
+                            CK(cudaStreamWaitEvent(peer.st, ev_route, 0));
+                            CK(cudaMemcpyAsync(peer.x_norm, peer.h_x, x_bytes, cudaMemcpyHostToDevice, peer.st));
+                        }
+                    }
+                    K::quantize_q8_1_rows(peer.x_norm, T, N, peer.xq, peer.st);
+                }
+                K::native_expert_grouped(L.L, peer.grp_ptr, peer.grp_start, peer.n_groups,
+                                         peer.ent_dst, peer.ent_tok, cap_peer, n_ent,
+                                         peer.xq, peer.escr, peer.eparts, peer.st);
+            }
+            const int n4 = ((N & 3) == 0) ? (N >> 2) : N;
+            k_combine_experts_masked_add<<<dim3((unsigned) ((n4 + 255) / 256), (unsigned) T), 256, 0, peer.st>>>(
+                peer.eparts, peer.ewts, peer.ids, L.peer_d_slot_of, nullptr, peer.sum_out, N, Kp);
+            if (peer.p2p) {
+                CK(cudaMemcpyPeerAsync(peer.d_peer_sum, peer.primary_dev, peer.sum_out, peer.dev, x_bytes, peer.st));
+            } else {
+                CK(cudaMemcpyAsync(peer.h_sum, peer.sum_out, x_bytes, cudaMemcpyDeviceToHost, peer.st));
+            }
+            CK(cudaEventRecord(peer.ev_done, peer.st));
+
+            // Join peer partial sum back onto primary stream
+            CK(cudaSetDevice(peer.primary_dev));
+            CK(cudaStreamWaitEvent(st, peer.ev_done, 0));
+            if (!peer.p2p) {
+                CK(cudaMemcpyAsync(peer.d_peer_sum, peer.h_sum, x_bytes, cudaMemcpyHostToDevice, st));
+            }
+            if (has_gpu) {
+                k_combine_experts_masked_add<<<dim3((unsigned) ((n4 + 255) / 256), (unsigned) T), 256, 0, st>>>(
+                    eparts, ewts, ids, L.d_slot_of, peer.d_peer_sum, moe_raw, N, Kp);
+            } else {
+                CK(cudaMemcpyAsync(moe_raw, peer.d_peer_sum, x_bytes, cudaMemcpyDeviceToDevice, st));
+            }
+            hy_gpu += n_ent;
             if (prof) { CK(cudaStreamSynchronize(st)); p_moe_gpu_ms += ms_since(tp_moe_r0); }
             return;
         }
@@ -1981,7 +2235,7 @@ struct Engine {
         for (size_t li = 0; li < m->layers.size(); ++li) {
             PhysLayer& L = m->layers[li];
             const int S = L.n_slots;
-            if (S <= 0 || S >= ne) continue;
+            if (S <= 0 || S >= ne || !L.hblobs) continue;
             const bool is_core = ((int) li >= hp.core_start && (int) li < hp.core_end);
             const double weight = is_core ? 3.0 : ((L.L.gu_type == 13) ? 1.43 : 1.0);
             for (int x = 0; x < ne; ++x) order[(size_t) x] = x;
@@ -3159,7 +3413,17 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
         const size_t extra_resv = core_res_hy ? ((size_t) 16 << 20) : ((size_t) 144 << 20);
         budget = budget > extra_resv ? (budget - extra_resv) : 0;
     }
-    if (budget < all_exps_bytes && stage_mb > 0 && max_exp_stride > 0) {
+    size_t peer_budget = 0;
+    if (E.peer.dev >= 0) {
+        size_t pfr = 0, ptot = 0;
+        CK(cudaSetDevice(E.peer.dev));
+        CK(cudaMemGetInfo(&pfr, &ptot));
+        CK(cudaSetDevice(E.peer.primary_dev));
+        const size_t presv = (size_t) E.peer.reserve_mib << 20;
+        peer_budget = pfr > presv ? (pfr - presv) : 0;
+    }
+    const bool peer_covers_all = (E.peer.dev >= 0) && (budget + peer_budget >= all_exps_bytes);
+    if (!peer_covers_all && budget < all_exps_bytes && stage_mb > 0 && max_exp_stride > 0) {
         size_t req_stage = stage_mb << 20;
         if (req_stage < max_exp_stride) req_stage = max_exp_stride;
         const int pref_cnt = std::clamp(E.profile.pp_stage_cnt_pref > 0 ? E.profile.pp_stage_cnt_pref : 3, 2, Engine::kMaxPpStages);
@@ -3213,7 +3477,14 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
     size_t tier1_full = 0;
     for (int ip : tier1) tier1_full += (size_t) ne * m.layers[(size_t) ip].stride;
     if (!tier1.empty()) {
-        if (used + tier1_full <= budget) {
+        if (E.peer.dev >= 0 && E.peer.balance_mode >= 2 &&
+            used + tier1_full / 2 <= budget && peer_budget >= tier1_full / 2) {
+            const int half = ne / 2;
+            for (int ip : tier1) {
+                slots[(size_t) ip] = half;
+                used += (size_t) half * m.layers[(size_t) ip].stride;
+            }
+        } else if (used + tier1_full <= budget) {
             for (int ip : tier1) slots[(size_t) ip] = ne;
             used += tier1_full;
         } else {
@@ -3238,11 +3509,16 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
         }
     }
 
-    // Priority 2: Distribute remaining VRAM equally across tier2, then greedily fill leftover budget
+    // Priority 2: Distribute remaining VRAM equally across tier2, then greedily fill leftover budget.
+    // When --peer-balance is enabled and peer GPU has headroom for half of tier2, split tier2 50/50 across GPUs.
     if (!tier2.empty() && budget > used) {
         size_t sum_tier2_stride = 0;
         for (int ip : tier2) sum_tier2_stride += m.layers[(size_t) ip].stride;
-        const int s = sum_tier2_stride > 0 ? (int) std::min<size_t>((size_t) ne, (budget - used) / sum_tier2_stride) : 0;
+        int t2_cap = ne;
+        if (E.peer.dev >= 0 && E.peer.balance_mode >= 1 && peer_budget >= (size_t) (ne - ne / 2) * sum_tier2_stride) {
+            t2_cap = ne / 2;
+        }
+        const int s = sum_tier2_stride > 0 ? (int) std::min<size_t>((size_t) t2_cap, (budget - used) / sum_tier2_stride) : 0;
         if (s > 0) {
             for (int ip : tier2) slots[(size_t) ip] = s;
             used += (size_t) s * sum_tier2_stride;
@@ -3252,7 +3528,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
             added = false;
             for (int ip : tier2) {
                 const size_t st_b = m.layers[(size_t) ip].stride;
-                if (slots[(size_t) ip] < ne && used + st_b <= budget) {
+                if (slots[(size_t) ip] < t2_cap && used + st_b <= budget) {
                     slots[(size_t) ip] += 1;
                     used += st_b;
                     added = true;
@@ -3264,7 +3540,10 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
     std::vector<uint8_t> tmp;
     bool need_cpu = false;
     int total_vram_experts = 0;
+    int total_peer_experts = 0;
     size_t actual_used = 0;
+    size_t peer_actual_used = 0;
+    size_t peer_rem = peer_budget;
     size_t pinned_used = 0;
     size_t max_pin_bytes = (size_t) 7168 << 20;
 #if !defined(_WIN32)
@@ -3333,8 +3612,34 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
         slots[(size_t) ip] = s;
         L.n_slots = s;
         L.exp_in_slot.assign((size_t) s, -1);
+        L.peer_slot_of.assign((size_t) ne, -1);
+        L.peer_slots = 0;
 
-        if (s < ne) {
+        int ps = 0;
+        if (s < ne && E.peer.dev >= 0 && L.gu_type != 30 && peer_rem >= L.stride) {
+            ps = (int) std::min<size_t>((size_t) (ne - s), peer_rem / L.stride);
+            void* pdbl = nullptr;
+            CK(cudaSetDevice(E.peer.dev));
+            while (ps > 0 && cudaMalloc(&pdbl, (size_t) ps * L.stride) != cudaSuccess) {
+                (void) cudaGetLastError();
+                --ps;
+            }
+            if (ps > 0 && pdbl) {
+                L.peer_blobs = (uint8_t*) pdbl;
+                m.peer_gpu_allocs.push_back({E.peer.dev, L.peer_blobs});
+                CK(cudaMalloc(&L.peer_d_slot_of, (size_t) ne * sizeof(int32_t)));
+                m.peer_gpu_allocs.push_back({E.peer.dev, L.peer_d_slot_of});
+                const size_t pbytes = (size_t) ps * L.stride;
+                peer_actual_used += pbytes;
+                peer_rem = peer_rem > pbytes ? (peer_rem - pbytes) : 0;
+            } else {
+                ps = 0;
+            }
+            CK(cudaSetDevice(E.peer.primary_dev));
+        }
+        L.peer_slots = ps;
+
+        if (s + ps < ne) {
             need_cpu = true;
             const size_t hb_bytes = (size_t) ne * L.stride;
             const bool want_pin = (std::getenv("STRATA_NO_PIN_EXPERTS") == nullptr) && (pinned_used + hb_bytes <= max_pin_bytes);
@@ -3366,7 +3671,20 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
             CK(cudaMemcpy(L.d_slot_of, L.slot_of.data(), (size_t) ne * sizeof(int32_t), cudaMemcpyHostToDevice));
             total_vram_experts += s;
         }
-        if (s > 0 && s < ne) E.hybrid = true;
+        if (ps > 0) {
+            tmp.resize(L.L.bytes);
+            CK(cudaSetDevice(E.peer.dev));
+            for (int k = 0; k < ps; ++k) {
+                const int e = s + k;
+                const uint8_t* src = L.hblobs ? (L.hblobs + (size_t) e * L.stride) : (build_expert_blob(L, e, tmp.data()), tmp.data());
+                CK(cudaMemcpy(L.peer_blobs + (size_t) k * L.stride, src, L.L.bytes, cudaMemcpyHostToDevice));
+                L.peer_slot_of[(size_t) e] = k;
+            }
+            CK(cudaMemcpy(L.peer_d_slot_of, L.peer_slot_of.data(), (size_t) ne * sizeof(int32_t), cudaMemcpyHostToDevice));
+            CK(cudaSetDevice(E.peer.primary_dev));
+            total_peer_experts += ps;
+        }
+        if (s > 0 && s + ps < ne) E.hybrid = true;
     }
     E.pinned_used = pinned_used;
     used = actual_used;
@@ -3399,13 +3717,31 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
         tier2_min = std::min(tier2_min, slots[(size_t) ip]);
         tier2_max = std::max(tier2_max, slots[(size_t) ip]);
     }
-    std::fprintf(stderr,
-                 "strata-inkling2: placed %d/%lld experts in VRAM (%.2f GiB, tier1=%d/128/layer, tier2=%d..%d/128/layer, free=%.0f MiB) in %.2f s\n",
-                 total_vram_experts, (long long) hp.n_phys * ne, (double) used / (1 << 30),
-                 tier1.empty() ? 0 : slots[(size_t) tier1[0]],
-                 tier2.empty() ? 0 : tier2_min, tier2.empty() ? 0 : tier2_max,
-                 (double) fr_after / (1 << 20),
-                 ms_since(t0) / 1000.0);
+    E.has_any_peer = (total_peer_experts > 0);
+    if (E.peer.dev >= 0 && total_peer_experts > 0) {
+        size_t pfr_after = 0, ptot_after = 0;
+        CK(cudaSetDevice(E.peer.dev));
+        CK(cudaMemGetInfo(&pfr_after, &ptot_after));
+        CK(cudaSetDevice(E.peer.primary_dev));
+        std::fprintf(stderr,
+                     "strata-inkling2: placed %d/%lld experts on GPU%d (%.2f GiB, tier1=%d/128, tier2=%d..%d/128, free=%.0f MiB) + %d on GPU%d (%.2f GiB, free=%.0f MiB, p2p=%s, total=%d/%lld GPU) in %.2f s\n",
+                     total_vram_experts, (long long) hp.n_phys * ne, E.peer.primary_dev, (double) used / (1 << 30),
+                     tier1.empty() ? 0 : slots[(size_t) tier1[0]],
+                     tier2.empty() ? 0 : tier2_min, tier2.empty() ? 0 : tier2_max,
+                     (double) fr_after / (1 << 20),
+                     total_peer_experts, E.peer.dev, (double) peer_actual_used / (1 << 30),
+                     (double) pfr_after / (1 << 20), E.peer.p2p ? "on" : "host-pinned",
+                     total_vram_experts + total_peer_experts, (long long) hp.n_phys * ne,
+                     ms_since(t0) / 1000.0);
+    } else {
+        std::fprintf(stderr,
+                     "strata-inkling2: placed %d/%lld experts in VRAM (%.2f GiB, tier1=%d/128/layer, tier2=%d..%d/128/layer, free=%.0f MiB) in %.2f s\n",
+                     total_vram_experts, (long long) hp.n_phys * ne, (double) used / (1 << 30),
+                     tier1.empty() ? 0 : slots[(size_t) tier1[0]],
+                     tier2.empty() ? 0 : tier2_min, tier2.empty() ? 0 : tier2_max,
+                     (double) fr_after / (1 << 20),
+                     ms_since(t0) / 1000.0);
+    }
     return true;
 }
 
@@ -3675,6 +4011,9 @@ int run(int argc, char** argv) {
     int draft_max = 3;
     int cpu_threads = 0;
     double expert_vram = -1.0;
+    int peer_device = -1;
+    int peer_reserve_mib = 512;
+    int peer_balance = (std::getenv("STRATA_PEER_BALANCE") != nullptr) ? std::atoi(std::getenv("STRATA_PEER_BALANCE")) : 2;
     bool serve = false;
     bool bench = false;
     bool kv_q8 = true;
@@ -3698,6 +4037,10 @@ int run(int argc, char** argv) {
         else if (a == "--max-new" || a == "-n") max_new = std::atoi(next_arg());
         else if (a == "--tokens") tokens_str = next_arg();
         else if (a == "--expert-vram") expert_vram = std::atof(next_arg());
+        else if (a == "--peer-device") peer_device = std::atoi(next_arg());
+        else if (a == "--peer-reserve-mib") peer_reserve_mib = std::max(128, std::atoi(next_arg()));
+        else if (a == "--peer-balance") peer_balance = 2;
+        else if (a == "--peer-overflow") peer_balance = 0;
         else if (a == "--cpu-threads" || a == "--pool-workers") cpu_threads = std::atoi(next_arg());
         else if (a == "--dump-logits") dump_logits_path = next_arg();
         else if (a == "--kv-f16") kv_q8 = false;
@@ -3748,6 +4091,17 @@ int run(int argc, char** argv) {
 #endif
         pin.vram_total_bytes = vtot;
         pin.vram_free_bytes = vfree;
+        if (peer_device >= 0 && peer_device != cur_dev) {
+            int ndev = 0;
+            if (cudaGetDeviceCount(&ndev) == cudaSuccess && peer_device < ndev) {
+                size_t pfree = 0, ptot = 0;
+                if (cudaSetDevice(peer_device) == cudaSuccess && cudaMemGetInfo(&pfree, &ptot) == cudaSuccess) {
+                    const size_t p_overhead = ((size_t) std::max(128, peer_reserve_mib) + 512u) << 20;
+                    pin.peer_vram_free_bytes = pfree > p_overhead ? (pfree - p_overhead) : 0;
+                }
+                (void) cudaSetDevice(cur_dev);
+            }
+        }
         pin.max_ctx = max_ctx;
         pin.requested_chunk = chunk;
         pin.kv_q8 = kv_q8;
@@ -3781,6 +4135,14 @@ int run(int argc, char** argv) {
     if (!E.init(m, max_ctx, chunk, kv_q8, err, dm && dm->has_quant_dense, dm ? (draft_max + 1) : 1, &prof_cfg)) {
         std::fprintf(stderr, "strata-inkling2: engine init failed: %s\n", err.c_str());
         return 1;
+    }
+    if (peer_device >= 0) {
+        int cur_dev = 0;
+        (void) cudaGetDevice(&cur_dev);
+        if (!E.peer.init(cur_dev, peer_device, peer_reserve_mib, peer_balance, chunk, m.hp, err)) {
+            std::fprintf(stderr, "strata-inkling2: peer init failed: %s\n", err.c_str());
+            return 1;
+        }
     }
     if (dm) {
         dspark = std::make_unique<DsparkEngine>();

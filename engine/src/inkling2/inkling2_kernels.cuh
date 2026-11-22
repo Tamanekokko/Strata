@@ -6922,6 +6922,46 @@ __global__ void k_combine_experts_hybrid(const float* __restrict__ eparts, const
     out[i] = s;
 }
 
+/// Batched masked expert combine (T >= 1): sums only experts with slot_of[id] >= 0,
+/// optionally adding base_sum[t * N + i] (when base_sum != nullptr).
+/// Used both on peer GPU (base_sum == nullptr -> partial sum) and primary GPU (base_sum == d_peer_sum -> final combine).
+__global__ void k_combine_experts_masked_add(const float* __restrict__ eparts, const float* __restrict__ ewts,
+                                             const int32_t* __restrict__ ids, const int32_t* __restrict__ slot_of,
+                                             const float* __restrict__ base_sum, float* __restrict__ out,
+                                             int N, int top_k) {
+    const int t = (int) blockIdx.y;
+    const int32_t* t_ids = ids + (size_t) t * top_k;
+    const float* t_ewts = ewts + (size_t) t * top_k;
+    const float* t_ep = eparts + (size_t) t * top_k * N;
+    float* t_out = out + (size_t) t * N;
+    if ((N & 3) == 0) {
+        const int n4 = N >> 2;
+        const int i4 = (int) blockIdx.x * blockDim.x + threadIdx.x;
+        if (i4 >= n4) return;
+        float sx = 0.0f, sy = 0.0f, sz = 0.0f, sw = 0.0f;
+        if (base_sum) {
+            const float4 b = reinterpret_cast<const float4*>(base_sum + (size_t) t * N)[i4];
+            sx = b.x; sy = b.y; sz = b.z; sw = b.w;
+        }
+        for (int k = 0; k < top_k; ++k) {
+            if (slot_of[t_ids[k]] >= 0) {
+                const float w = t_ewts[k];
+                const float4 v = reinterpret_cast<const float4*>(t_ep + (size_t) k * N)[i4];
+                sx += w * v.x; sy += w * v.y; sz += w * v.z; sw += w * v.w;
+            }
+        }
+        reinterpret_cast<float4*>(t_out)[i4] = make_float4(sx, sy, sz, sw);
+        return;
+    }
+    const int i = (int) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+    float s = base_sum ? base_sum[(size_t) t * N + i] : 0.0f;
+    for (int k = 0; k < top_k; ++k) {
+        if (slot_of[t_ids[k]] >= 0) s += t_ewts[k] * t_ep[(size_t) k * N + i];
+    }
+    t_out[i] = s;
+}
+
 __global__ void k_merge_cpu(float* __restrict__ eparts, const float* __restrict__ ecpu,
                             const int32_t* __restrict__ miss, int N) {
     const int e = blockIdx.x;

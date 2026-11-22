@@ -7684,7 +7684,20 @@ bool gemm_iq_f16_grouped(int ty, const void* W, size_t expert_bytes, int n_out, 
                                                                                   (const __half*) X, ldx, bounds, mt, Y, ldy);
     return cudaGetLastError() == cudaSuccess;
 }
+}  // namespace strata::kernels
+#else
+namespace strata::kernels {
+bool gemm_iq_f16_grouped(int, const void*, size_t, int, int, const void*, int, const int32_t*, int, int, float*, int, void*) {
+    return false;
+}
+}  // namespace strata::kernels
+#endif
 
+#if defined(__HIP_PLATFORM_AMD__)
+#include "strata/hip_compat/mma.h"
+#endif
+
+namespace strata::kernels {
 namespace {
 
 __global__ void situ_f16_valid_kernel(const float* __restrict__ gate, const float* __restrict__ up,
@@ -7736,7 +7749,7 @@ __global__ void swiglu_f16_valid_kernel(const float* __restrict__ gate, const fl
     }
 }
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700) || (defined(__HIP_PLATFORM_AMD__) && (defined(__GFX11__) || defined(__GFX12__)))
 __device__ __forceinline__ __half ue4m3_to_half_halved(uint8_t x) {
     if (x == 0 || x == 0x7F) return __ushort_as_half(0);
     const uint32_t exp = (x >> 3) & 0xFu, man = x & 0x7u;
@@ -7858,10 +7871,10 @@ __global__ void __launch_bounds__(256, (BN == 128) ? 2 : 3) wmma_grouped_64_kern
     const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
     const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_idx,
     const __half* __restrict__ X, NativeExpertLayout L, float* __restrict__ out0, float* __restrict__ out1) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700) || (defined(__HIP_PLATFORM_AMD__) && (defined(__GFX11__) || defined(__GFX12__)))
     using namespace nvcuda;
     constexpr int BM = 64, WK = 64, LD = 72;
-#if __CUDA_ARCH__ >= 750
+#if defined(__HIP_PLATFORM_AMD__) || __CUDA_ARCH__ >= 750
     constexpr int MW = (BN == 128) ? 2 : 4;
 #endif
     constexpr int NW = (BN == 128) ? 4 : 2;
@@ -7893,7 +7906,7 @@ __global__ void __launch_bounds__(256, (BN == 128) ? 2 : 3) wmma_grouped_64_kern
     const int wr = tid >> 2, sb = tid & 3;
     const int xr = tid >> 2, xc = (tid & 3) * 16;
 
-#if __CUDA_ARCH__ < 750
+#if !defined(__HIP_PLATFORM_AMD__) && __CUDA_ARCH__ < 750
     const int lane = tid & 31;
     const int qa_row = ((lane & 16) >> 2) + ((lane & 4) << 1) + (lane & 3);
     const int kb_row = ((lane & 16) >> 2) + (lane & 8) + (lane & 3);
@@ -7925,7 +7938,7 @@ __global__ void __launch_bounds__(256, (BN == 128) ? 2 : 3) wmma_grouped_64_kern
             const int in_row = x_ok ? (IS_DOWN ? (c0 + xr) : ent_idx[c0 + xr]) : 0;
             const __half* xp = X + (size_t) in_row * K + xc;
 
-#if __CUDA_ARCH__ < 750
+#if !defined(__HIP_PLATFORM_AMD__) && __CUDA_ARCH__ < 750
             float acc[MR][2][8];
 #pragma unroll
             for (int mr = 0; mr < MR; ++mr) {
@@ -7980,7 +7993,7 @@ __global__ void __launch_bounds__(256, (BN == 128) ? 2 : 3) wmma_grouped_64_kern
                         nx1 = x_ok ? *reinterpret_cast<const uint4*>(nxp + 8) : make_uint4(0, 0, 0, 0);
                         wp = nwp;
                     }
-#if __CUDA_ARCH__ < 750
+#if !defined(__HIP_PLATFORM_AMD__) && __CUDA_ARCH__ < 750
 #pragma unroll
                     for (int kk = 0; kk < WK; kk += 8) {
                         const uint4 b0 = *reinterpret_cast<const uint4*>(sw_r0 + kk);
@@ -8032,7 +8045,7 @@ __global__ void __launch_bounds__(256, (BN == 128) ? 2 : 3) wmma_grouped_64_kern
                         dq_sub16_k64_store<WT>(we_t + (size_t) rb * row_stride, k0, sb, sw + (rb + wr) * LD + sb * 16);
                     }
                     __syncthreads();
-#if __CUDA_ARCH__ < 750
+#if !defined(__HIP_PLATFORM_AMD__) && __CUDA_ARCH__ < 750
 #pragma unroll
                     for (int kk = 0; kk < WK; kk += 8) {
                         const uint4 b0 = *reinterpret_cast<const uint4*>(sw_r0 + kk);
@@ -8068,7 +8081,7 @@ __global__ void __launch_bounds__(256, (BN == 128) ? 2 : 3) wmma_grouped_64_kern
                 }
             }
 
-#if __CUDA_ARCH__ < 750
+#if !defined(__HIP_PLATFORM_AMD__) && __CUDA_ARCH__ < 750
 #pragma unroll
             for (int mr = 0; mr < MR; ++mr) {
                 const int r0 = wm * MR * 16 + mr * 16 + acc_r0;
@@ -8143,7 +8156,7 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
     const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
     const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_idx,
     const __half* __restrict__ X, NativeExpertLayout L, float* __restrict__ out0, float* __restrict__ out1) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700) || (defined(__HIP_PLATFORM_AMD__) && (defined(__GFX11__) || defined(__GFX12__)))
     using namespace nvcuda;
     constexpr int BM = 128, BN = 128, WK = 64, LD = 72;
     __shared__ __align__(16) __half smem[(BM + BN) * LD];
@@ -8174,7 +8187,7 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
     const int wr = tid >> 2, sb = tid & 3;
     const int xr = wr, xc = sb * 16;
 
-#if __CUDA_ARCH__ < 750
+#if !defined(__HIP_PLATFORM_AMD__) && __CUDA_ARCH__ < 750
     const int lane = tid & 31;
     const int qa_row = ((lane & 16) >> 2) + ((lane & 4) << 1) + (lane & 3);
     const int kb_row = ((lane & 16) >> 2) + (lane & 8) + (lane & 3);
@@ -8209,7 +8222,7 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
             const __half* xp0 = X + (size_t) in_row0 * K + xc;
             const __half* xp1 = X + (size_t) in_row1 * K + xc;
 
-#if __CUDA_ARCH__ < 750
+#if !defined(__HIP_PLATFORM_AMD__) && __CUDA_ARCH__ < 750
             float acc[4][2][8];
 #pragma unroll
             for (int mr = 0; mr < 4; ++mr) {
@@ -8226,7 +8239,7 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
 #endif
 
             if (has_hi) {
-#if __CUDA_ARCH__ < 750
+#if !defined(__HIP_PLATFORM_AMD__) && __CUDA_ARCH__ < 750
                 const __half* sx_hi = sx + (wm * 64 + qa_row) * LD;
 #endif
                 uint32_t pf_w0[2], pf_w1[2];
@@ -8270,7 +8283,7 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
                             pf_d[1] = wpb1[sb];
                         }
                     }
-#if __CUDA_ARCH__ < 750
+#if !defined(__HIP_PLATFORM_AMD__) && __CUDA_ARCH__ < 750
 #pragma unroll 1
                     for (int kk = 0; kk < WK; kk += 8) {
                         const uint4 b0 = *reinterpret_cast<const uint4*>(sw_r0 + kk);
@@ -8302,7 +8315,7 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
                     __syncthreads();
                 }
             } else {
-#if __CUDA_ARCH__ < 750
+#if !defined(__HIP_PLATFORM_AMD__) && __CUDA_ARCH__ < 750
                 const __half* sx_lo = sx + (wm * 32 + qa_row) * LD;
 #endif
                 uint32_t pf_w0[2], pf_w1[2];
@@ -8343,7 +8356,7 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
                             pf_d[1] = wpb1[sb];
                         }
                     }
-#if __CUDA_ARCH__ < 750
+#if !defined(__HIP_PLATFORM_AMD__) && __CUDA_ARCH__ < 750
 #pragma unroll 1
                     for (int kk = 0; kk < WK; kk += 8) {
                         const uint4 b0 = *reinterpret_cast<const uint4*>(sw_r0 + kk);
@@ -8376,7 +8389,7 @@ __global__ void __launch_bounds__(256, 2) wmma_grouped_128_kernel(
                 }
             }
 
-#if __CUDA_ARCH__ < 750
+#if !defined(__HIP_PLATFORM_AMD__) && __CUDA_ARCH__ < 750
             const int mr_lim = has_hi ? 4 : 2;
             const int wm_base = has_hi ? (wm * 64) : (wm * 32);
 #pragma unroll
@@ -8466,6 +8479,10 @@ bool native_expert_grouped_wmma(const NativeExpertLayout& L, const unsigned long
         int maj = 0, mnr = 0;
         if (cudaDeviceGetAttribute(&maj, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) return false;
         (void) cudaDeviceGetAttribute(&mnr, cudaDevAttrComputeCapabilityMinor, dev);
+#if defined(__HIP_PLATFORM_AMD__)
+        cc_ok[dev] = (maj >= 11) ? 2 : 1;
+        cc_volta[dev] = 0;
+#else
         cc_ok[dev] = (maj >= 7) ? 2 : 1;
         cc_volta[dev] = (maj == 7 && mnr < 5) ? 1 : 0;
         if (maj >= 7) {
@@ -8484,6 +8501,7 @@ bool native_expert_grouped_wmma(const NativeExpertLayout& L, const unsigned long
             cudaFuncSetAttribute(wmma_grouped_128_kernel<8, false>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
             cudaFuncSetAttribute(wmma_grouped_128_kernel<8, true>, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
         }
+#endif
     }
     if (cc_ok[dev] != 2) return false;
 
@@ -8577,15 +8595,3 @@ bool native_expert_grouped_wmma(const NativeExpertLayout& L, const unsigned long
     return true;
 }
 }  // namespace strata::kernels
-#else
-namespace strata::kernels {
-bool gemm_iq_f16_grouped(int, const void*, size_t, int, int, const void*, int, const int32_t*, int, int, float*, int, void*) {
-    return false;
-}
-bool native_expert_grouped_wmma(const NativeExpertLayout&, const unsigned long long*, const int32_t*,
-                                const int32_t*, const int32_t*, const int32_t*,
-                                int64_t, int64_t, const void*, void*, float*, void*, int64_t) {
-    return false;
-}
-}  // namespace strata::kernels
-#endif

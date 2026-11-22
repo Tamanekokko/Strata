@@ -16,9 +16,9 @@
 
 ---
 
-**`Tamanekokko/Strata`** is a ROCm/HIP-enabled fork of [kuraneko1/Strata](https://github.com/kuraneko1/Strata) (upstream [Niko1221/Strata](https://github.com/Niko1221/Strata)) adding **single-GPU AMD Radeon (ROCm/HIP)** support to **`strata-inkling2`**, including RDNA4 WMMA prefill attention and automatic `rdna4` / `rdna3` VRAM profiling.
+**`Tamanekokko/Strata`** is a ROCm/HIP-enabled fork of [kuraneko1/Strata](https://github.com/kuraneko1/Strata) (upstream [Niko1221/Strata](https://github.com/Niko1221/Strata)) adding **single-GPU and dual-GPU AMD Radeon (ROCm/HIP)** support to **`strata-inkling2`**, including RDNA4 WMMA prefill attention & grouped MoE (`hip_compat/mma.h`), parallel peer-GPU MoE (`--peer-device`), and automatic `rdna4` / `rdna3` VRAM profiling.
 
-It runs **65K–262K** context on a single **16 GB AMD Radeon RX 9060 XT (ROCm/HIP)** or **12 GB RTX 4070 (CUDA)**, and **819K–1M** context on a **32 GB Tesla V100** with **zero quantization or precision changes**, served behind an OpenAI- and Anthropic-compatible HTTP API and built-in Web UI (`serve.server`).
+It runs **65K–262K** context on a single **16 GB AMD Radeon RX 9060 XT (ROCm/HIP)**, **65K–786K** full-GPU context (zero CPU fallback) on **dual RX 9060 XT 16 GB (`--peer-device 1`)**, **65K–262K** on a **12 GB RTX 4070 (CUDA)**, and **819K–1M** on a **32 GB Tesla V100** with **zero quantization or precision changes**, served behind an OpenAI- and Anthropic-compatible HTTP API and built-in Web UI (`serve.server`).
 
 ## Highlights
 
@@ -38,11 +38,14 @@ The profile selector separates **GPU architecture** (`sm70`, `sm89`, `generic`, 
 | **RTX 4070 12 GB** (`sm_89`) | `262144` | `sm89 + tight_hybrid` | `2048` | Dynamic `32K → 262K` | Adaptive eviction (`74.9%` hit @ 262K) |
 | **Tesla V100 32 GB** (`sm_70`) | `819200` (+ DSpark) | `sm70 + full_vram` | `1024` | Upfront `819K` | `3,072 / 3,072` (`100%` VRAM, `916 MiB` free) |
 | **Tesla V100 32 GB** (`sm_70`) | `1048576` | `sm70 + core_resident_hybrid` | `1024` | Dynamic | `2,897 / 3,072` (`tier1` 100%) |
-| **RX 9060 XT 16 GB** (`gfx1200`, HIP) | `65536` | `rdna4 + core_resident_hybrid` | `1024` | Upfront `65K` (0s growth) | `2,734 / 3,072` (`tier1` 100%, `tier2` 99–101/128) |
-| **RX 9060 XT 16 GB** (`gfx1200`, HIP) | `131072` | `rdna4 + core_resident_hybrid` | `1024` | Upfront `131K` (0s growth) | `2,521 / 3,072` (`tier1` 100%, `tier2` 82–83/128) |
-| **RX 9060 XT 16 GB** (`gfx1200`, HIP) | `262144` | `rdna4 + core_resident_hybrid` | `1024` | Upfront `262K` (0s growth) | `2,098 / 3,072` (`tier1` 100%, `tier2` 46–48/128) |
+| **RX 9060 XT 16 GB** (`gfx1200`, HIP) | `65536` | `rdna4 + core_resident_hybrid` | `1024` | Upfront `65K` (0s growth) | `2,732 / 3,072` (`tier1` 100%, `tier2` 99–100/128) |
+| **RX 9060 XT 16 GB** (`gfx1200`, HIP) | `131072` | `rdna4 + core_resident_hybrid` | `1024` | Upfront `131K` (0s growth) | `2,519 / 3,072` (`tier1` 100%, `tier2` 81–82/128) |
+| **RX 9060 XT 16 GB** (`gfx1200`, HIP) | `262144` | `rdna4 + core_resident_hybrid` | `1024` | Upfront `262K` (0s growth) | `2,096 / 3,072` (`tier1` 100%, `tier2` 46–47/128) |
+| **RX 9060 XT 16 GB ×2** (`--peer-device 1`) | `65536–262144` | `rdna4 + full_vram` | `1024` | Upfront `65K–262K` | `3,072 / 3,072` (`1,536 + 1,536`, 50/50 parallel MoE) |
+| **RX 9060 XT 16 GB ×2** (`--peer-device 1`) | `524288` | `rdna4 + full_vram` | `1024` | Upfront `524K` | `3,072 / 3,072` (`1,132` GPU0 + `1,940` GPU1, `tier1` 50/50) |
+| **RX 9060 XT 16 GB ×2** (`--peer-device 1`) | `786432` | `rdna4 + full_vram` | `512` | Upfront `786K` | `3,072 / 3,072` (`259` GPU0 + `2,813` GPU1, 0 CPU) |
 
-> **AMD Radeon GPUs (ROCm / HIP, single GPU)**: Hardware-verified in this fork on **Radeon RX 9060 XT 16 GB** (`gfx1200`, RDNA4) with wave32 RDNA4 WMMA Q8-KV prefill attention and automatic 512 MiB `hipBLASLt` workspace reserve. RDNA3 (`gfx11xx`, e.g. RX 7900 XTX / RX 7800 XT) maps to the `rdna3` profile with WMMA support (unverified on hardware); other ROCm GPUs are designed to fall back to `hip_generic` (unverified on hardware).
+> **AMD Radeon GPUs (ROCm / HIP, single & dual GPU)**: Hardware-verified in this fork on **Radeon RX 9060 XT 16 GB** (`gfx1200`, RDNA4, both 1 GPU and 2 GPUs via `--peer-device 1`) with wave32 RDNA4 WMMA Q8-KV prefill attention, HIP-enabled WMMA grouped MoE, and automatic 512 MiB `hipBLASLt` workspace reserve. RDNA3 (`gfx11xx`, e.g. RX 7900 XTX / RX 7800 XT) maps to the `rdna3` profile with WMMA support (unverified on hardware); other ROCm GPUs are designed to fall back to `hip_generic` (unverified on hardware).
 >
 > **NVIDIA GPUs**: The RTX 4070 12 GB and Tesla V100 32 GB results below are upstream measurements from [kuraneko1/Strata](https://github.com/kuraneko1/Strata) (not re-benchmarked on NVIDIA hardware after this ROCm/HIP patch).
 >
@@ -52,17 +55,29 @@ The profile selector separates **GPU architecture** (`sm70`, `sm89`, `generic`, 
 
 All numbers measured on real hardware with `Inkling-2-Mini-UD-Q4_K_M.gguf` (`--kv-q8`, zero quantization change).
 
-### AMD Radeon RX 9060 XT 16 GB (`gfx1200`, Single GPU, Ryzen 5 7600, ROCm 10.1.0, DSpark OFF)
+### AMD Radeon RX 9060 XT 16 GB (`gfx1200`, Single GPU & Dual GPU, Ryzen 5 7600, ROCm 10.1.0, DSpark OFF)
 
-Measured with `--bench --kv-q8 --max-new 64` on a 4,096-token prompt (default settings, no environment variable overrides; `tier1` 128/128 core experts resident in VRAM across all three context tiers):
+Measured with `--bench --kv-q8 --max-new 64` on a 4,096-token prompt (default settings, no environment variable overrides):
+
+#### Dual GPU — RX 9060 XT 16 GB ×2 (`HIP_VISIBLE_DEVICES=0,1 --peer-device 1`)
+
+| Mode (`--max-context`) | Prefill (4K tok) | Decode (64 tok) | Expert Placement (GPU0 + GPU1) | CPU Misses |
+| --- | ---: | ---: | --- | ---: |
+| **`65536`** (`rdna4 + full_vram`, `T=1024`) | **`2,411.8 t/s`** | **`46.3 t/s`** | `1,536 + 1,536` (`3,072/3,072` GPU, 50/50 split) | `0` |
+| **`131072`** (`rdna4 + full_vram`, `T=1024`) | **`2,412.4 t/s`** | **`46.3 t/s`** | `1,536 + 1,536` (`3,072/3,072` GPU, 50/50 split) | `0` |
+| **`262144`** (`rdna4 + full_vram`, `T=1024`) | **`2,409.4 t/s`** | **`46.2 t/s`** | `1,536 + 1,536` (`3,072/3,072` GPU, 50/50 split) | `0` |
+| **`524288`** (`rdna4 + full_vram`, `T=1024`) | **`2,320.3 t/s`** | **`45.2 t/s`** | `1,132 + 1,940` (`3,072/3,072` GPU, `tier1` 50/50) | `0` |
+| **`786432`** (`rdna4 + full_vram`, `T=512`) | **`1,853.9 t/s`** | **`42.4 t/s`** | `259 + 2,813` (`3,072/3,072` GPU) | `0` |
+
+#### Single GPU — RX 9060 XT 16 GB (`HIP_VISIBLE_DEVICES=0`)
 
 | Mode (`--max-context`) | Prefill (4K tok) | Decode (64 tok) | VRAM Expert Placement | Free VRAM |
 | --- | ---: | ---: | --- | ---: |
-| **`65536`** (`rdna4 + core_resident_hybrid`, `T=1024`) | **`527.2 t/s`** | **`42.3 t/s`** | `2,734 / 3,072` (`tier1` 100%, `tier2` 99–101/128) | `504 MiB` |
-| **`131072`** (`rdna4 + core_resident_hybrid`, `T=1024`) | **`521.3 t/s`** | **`40.7 t/s`** | `2,521 / 3,072` (`tier1` 100%, `tier2` 82–83/128) | `502 MiB` |
-| **`262144`** (`rdna4 + core_resident_hybrid`, `T=1024`) | **`513.9 t/s`** | **`37.8 t/s`** | `2,098 / 3,072` (`tier1` 100%, `tier2` 46–48/128) | `504 MiB` |
+| **`65536`** (`rdna4 + core_resident_hybrid`, `T=1024`) | **`2,068.7 t/s`** | **`44.2 t/s`** | `2,732 / 3,072` (`tier1` 100%, `tier2` 99–100/128) | `504 MiB` |
+| **`131072`** (`rdna4 + core_resident_hybrid`, `T=1024`) | **`1,960.2 t/s`** | **`44.1 t/s`** | `2,519 / 3,072` (`tier1` 100%, `tier2` 81–82/128) | `502 MiB` |
+| **`262144`** (`rdna4 + core_resident_hybrid`, `T=1024`) | **`1,748.7 t/s`** | **`42.2 t/s`** | `2,096 / 3,072` (`tier1` 100%, `tier2` 46–47/128) | `504 MiB` |
 
-> **ROCm / HIP optimizations**: Includes a wave32-safe `hip_compat/mma.h` (`__builtin_amdgcn_wmma_f32_16x16x16_f16` on gfx11/gfx12), sub-warp mask fix in `hip_compat/intrinsics.hpp`, RDNA4/RDNA3 auto-profiles, and a 512 MiB VRAM reserve so `hipBLASLt` loads `TensileLibrary` cleanly out of the box (`+69.8%` prefill at 65K: `310.5 t/s` scalar fallback without `hipBLASLt` → `527.2 t/s` with WMMA + `hipBLASLt`).
+> **ROCm / HIP optimizations**: Includes a wave32-safe `hip_compat/mma.h` (`__builtin_amdgcn_wmma_f32_16x16x16_f16` on gfx11/gfx12), HIP-enabled `native_expert_grouped_wmma` (boosting 1-GPU 65K prefill `527.2 → 2,068.7 t/s`, **3.92×**), sub-warp mask fix in `hip_compat/intrinsics.hpp`, RDNA4/RDNA3 auto-profiles, 512 MiB VRAM reserve for `hipBLASLt` `TensileLibrary`, and `--peer-device` dual-GPU parallel MoE with 50/50 expert split, P2P (with automatic host-pinned fallback), and direct Q8_1 / FP16 activation transfer (reducing PCIe transfer volume by 50–72% vs FP32; optional `--peer-overflow` and `--peer-reserve-mib` flags available).
 
 ### RTX 4070 12 GB (`sm_89`, Ryzen 7 5700X, DSpark OFF)
 
@@ -195,7 +210,8 @@ Create a JSON config (e.g. `inkling2.json`). Simply change `--max-context` to sw
 ```
 
 Recommended `--max-context` presets:
-- **RX 9060 XT 16 GB (ROCm / HIP) — 65K / 131K / 262K**: `"--max-context", "65536"` (or `"131072"` / `"262144"`; `tier1` stays 100% resident in VRAM up to 262K)
+- **RX 9060 XT 16 GB ×2 (ROCm / HIP, Dual GPU) — 65K–786K**: add `"--peer-device", "1"` with `"--max-context", "262144"` (or `"524288"` / `"786432"`; 100% GPU resident, zero CPU fallback; set `HIP_VISIBLE_DEVICES=0,1` in `env` on systems with an iGPU)
+- **RX 9060 XT 16 GB (ROCm / HIP, Single GPU) — 65K / 131K / 262K**: `"--max-context", "65536"` (or `"131072"` / `"262144"`; `tier1` stays 100% resident in VRAM up to 262K)
 - **RTX 4070 12 GB — fastest daily coding (`65K`)**: `"--max-context", "65536"`
 - **RTX 4070 12 GB — balanced long context (`131K`)**: `"--max-context", "131072"`
 - **RTX 4070 12 GB — max context (`262K`)**: `"--max-context", "262144"`
@@ -225,6 +241,11 @@ Point any OpenAI- or Anthropic-compatible client (Claude Code, Codex CLI, OpenCo
 Change only `--max-context` (and optionally `--draft` on 32 GB GPUs) — the engine auto-selects the matching profile, chunk size, and KV strategy.
 
 ```bash
+# AMD Radeon RX 9060 XT 16 GB ×2 (dual GPU, ROCm / HIP) — 65K / 131K / 262K / 524K / 786K (zero CPU fallback)
+HIP_VISIBLE_DEVICES=0,1 ./engine/build-hip/strata-inkling2 \
+  --model /path/to/Inkling-2-Mini-UD-Q4_K_M.gguf \
+  --peer-device 1 --max-context 262144 --kv-q8 --bench --max-new 64
+
 # AMD Radeon RX 9060 XT 16 GB (single GPU, ROCm / HIP) — 65K / 131K / 262K
 # (On systems with an iGPU or multiple GPUs, check device indices with `rocminfo` and set HIP_VISIBLE_DEVICES accordingly)
 HIP_VISIBLE_DEVICES=0 ./engine/build-hip/strata-inkling2 \

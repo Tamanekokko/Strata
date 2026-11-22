@@ -224,6 +224,36 @@ int main() {
         check(p.regime == VramRegime::FullVram, "RDNA3 24GB @ 262K fits FullVram");
     }
 
+    // 11. AMD RDNA4 16GB x2 (RX 9060 XT + --peer-device 1): FullVram at 512K and 768K
+    {
+        ProfileInput in;
+        in.cc_major = 12;
+        in.cc_minor = 0;
+        in.sm_count = 16;
+        in.is_hip = true;
+        in.vram_total_bytes = 16 * GiB;
+        in.vram_free_bytes = (size_t) (14.4 * (double) GiB);
+        in.peer_vram_free_bytes = (size_t) (14.9 * (double) GiB);
+        in.max_ctx = 524288;
+        in.kv_q8 = true;
+        in.tier1_experts_bytes = kTier1Bytes;
+        in.all_experts_bytes = kAllExpBytes;
+
+        const auto p512 = resolve_inkling2_profile(in);
+        std::printf("%s\n", format_profile_line(in, p512).c_str());
+        check(p512.arch.id == ArchId::HipRdna4, "RX 9060 XT x2 @ 512K selects HipRdna4");
+        check(p512.regime == VramRegime::FullVram, "RX 9060 XT x2 @ 512K fits FullVram across GPUs");
+        check(p512.full_kv_init == 524288, "RX 9060 XT x2 @ 512K allocates full 512K KV upfront");
+        check(p512.chunk == 1024, "RX 9060 XT x2 @ 512K keeps chunk=1024");
+        check(p512.pp_stage_mb == 0, "RX 9060 XT x2 @ 512K disables host PCIe expert staging");
+
+        in.max_ctx = 786432;
+        const auto p768 = resolve_inkling2_profile(in);
+        std::printf("%s\n", format_profile_line(in, p768).c_str());
+        check(p768.regime == VramRegime::FullVram, "RX 9060 XT x2 @ 768K fits FullVram across GPUs");
+        check(p768.full_kv_init == 786432, "RX 9060 XT x2 @ 768K allocates full 768K KV upfront");
+    }
+
     if (fails > 0) {
         std::printf("FAILED: %d check(s)\n", fails);
         return 1;

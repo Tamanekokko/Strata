@@ -170,6 +170,7 @@ struct ProfileInput {
     bool is_hip = false;
     size_t vram_total_bytes = 0;
     size_t vram_free_bytes = 0;       // Free VRAM after dense model (and optional draft weights) load
+    size_t peer_vram_free_bytes = 0;  // Optional peer GPU free VRAM (after peer scratch + reserve) when --peer-device is set
     int max_ctx = 65536;
     int requested_chunk = 0;          // 0 = auto; >0 = explicit user --chunk (never overridden)
     bool kv_q8 = true;
@@ -219,8 +220,12 @@ inline ResolvedProfile resolve_inkling2_profile(const ProfileInput& in) {
 
     const size_t full_vram_need = full_kv_total + swa_kv_1024 + engine_overhead_1024 + in.all_experts_bytes + 128 * MiB;
     const size_t core_hybrid_need = full_kv_total + swa_kv_1024 + engine_overhead_1024 + stage_bytes_pref + in.tier1_experts_bytes + 128 * MiB;
+    const size_t primary_kv_need = full_kv_total + swa_kv_1024 + engine_overhead_1024 + (in.is_hip ? 512 * MiB : 256 * MiB);
+    const size_t combined_vram_free = in.vram_free_bytes + in.peer_vram_free_bytes;
 
-    if (in.all_experts_bytes > 0 && cap_allows_full && in.vram_free_bytes >= full_vram_need) {
+    if (in.all_experts_bytes > 0 && cap_allows_full &&
+        ((in.vram_free_bytes >= full_vram_need) ||
+         (in.peer_vram_free_bytes > 0 && in.vram_free_bytes >= primary_kv_need && combined_vram_free >= full_vram_need))) {
         out.regime = VramRegime::FullVram;
     } else if (in.tier1_experts_bytes > 0 && cap_allows_core && in.vram_free_bytes >= core_hybrid_need) {
         out.regime = VramRegime::CoreResidentHybrid;
