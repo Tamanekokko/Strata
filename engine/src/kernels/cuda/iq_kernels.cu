@@ -1647,6 +1647,40 @@ __device__ __forceinline__ void row_dot_20_sub8(const uint8_t* row, const block_
 // 8-lane sub-warp row dot for K = nb * ipb == 36 (TD == 40, NVFP4 with n_ff == 1152): 4 rows per warp (32 rows per
 // 256-thread block), 89% lane balance, minimal register pressure, bitwise identical addition tree to row_dot_multi.
 template<int NC, bool EXACT_N = false>
+__device__ __forceinline__ void row_dot_18_sub8(const uint8_t* row, const block_q8_1* x, const int (&off)[NC], int n,
+                                                int t, float (&s)[NC], const float* __restrict__ s_ue4m3 = nullptr) {
+    using S = Split<40>;
+    {
+        const int k = t, kbx = k >> 1, iqs = (k & 1) << 2;
+        const typename S::W w = S::load_lut(row, kbx, iqs, s_ue4m3);
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (EXACT_N || c < n) s[c] = S::apply(w, x + off[c] + kbx * 2, iqs);
+    }
+    if (t < 2) {
+        const int k = t + 16, kbx = k >> 1, iqs = (k & 1) << 2;
+        const typename S::W w = S::load_lut(row, kbx, iqs, s_ue4m3);
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (EXACT_N || c < n) s[c] += S::apply(w, x + off[c] + kbx * 2, iqs);
+    }
+    {
+        const int k = t + 8, kbx = k >> 1, iqs = (k & 1) << 2;
+        const typename S::W w = S::load_lut(row, kbx, iqs, s_ue4m3);
+#pragma unroll
+        for (int c = 0; c < NC; ++c)
+            if (EXACT_N || c < n) s[c] = __fadd_rn(s[c], S::apply(w, x + off[c] + kbx * 2, iqs));
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        if (EXACT_N || c < n) {
+#pragma unroll
+            for (int o = 4; o > 0; o >>= 1) s[c] += __shfl_xor_sync(0xffffffffu, s[c], o);
+        }
+    }
+}
+
+template<int NC, bool EXACT_N = false>
 __device__ __forceinline__ void row_dot_36_sub8(const uint8_t* row, const block_q8_1* x, const int (&off)[NC], int n,
                                                 int t, float (&s)[NC], const float* __restrict__ s_ue4m3 = nullptr) {
     using S = Split<40>;
@@ -4498,6 +4532,52 @@ __global__ void __launch_bounds__(256, 4) native_gu_nvfp4_72_situ_q8_1_kernel(
     }
 }
 
+// Standalone zero-spill NVFP4 (type 40) down kernel for n_ff == 576 (18 dots, 8 lanes/row, 32 rows/block, SMEM hq).
+__global__ void __launch_bounds__(256, 4) native_down_nvfp4_18_kernel(
+    const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
+    const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_dst,
+    const block_q8_1* __restrict__ hq, NativeExpertLayout L, float* __restrict__ out) {
+    const int ng = *n_groups;
+    if (blockIdx.y >= ng) return;
+    __shared__ uint32_t s_hq_buf[GRP_NC * 18 * 9];
+    __shared__ float s_ue4m3[256];
+    s_ue4m3[threadIdx.x] = ue4m3_to_f32_half((uint8_t) threadIdx.x);
+    const int r = blockIdx.x * 32 + (threadIdx.x >> 3);
+    const int t = threadIdx.x & 7;
+    const bool valid_r = (r < L.n_embd);
+    const size_t w_off = L.down_off + (size_t) (valid_r ? r : 0) * L.d_row;
+    const block_q8_1* s_hq = reinterpret_cast<const block_q8_1*>(s_hq_buf);
+    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
+        const uint8_t* wr = (const uint8_t*) grp_ptr[g] + w_off;
+        const float sd = L.tail_off ? ((const float*) (grp_ptr[g] + L.tail_off))[2] : 1.0f;
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        for (int e = e0; e < e1; e += GRP_NC) {
+            const int n = min(GRP_NC, e1 - e);
+            const uint32_t* src = reinterpret_cast<const uint32_t*>(hq + (size_t) e * 18);
+            const int words = n * (18 * 9);
+            if (g > (int) blockIdx.y || e > e0) iq_sync_lds();
+            for (int i = threadIdx.x; i < words; i += 256) s_hq_buf[i] = src[i];
+            iq_sync_lds();
+            if (valid_r) {
+                if (n == 1) {
+                    const int off1[1] = { 0 };
+                    float s1[1];
+                    row_dot_18_sub8<1, true>(wr, s_hq, off1, 1, t, s1, s_ue4m3);
+                    if (t == 0) out[(size_t) ent_dst[e] * L.n_embd + r] = s1[0] * sd;
+                } else {
+                    const int off4[4] = { 0, 18, 36, 54 };
+                    float s4[4];
+                    row_dot_18_sub8<4, false>(wr, s_hq, off4, n, t, s4, s_ue4m3);
+                    if (t < n) {
+                        const float v = (t == 0) ? s4[0] : (t == 1) ? s4[1] : (t == 2) ? s4[2] : s4[3];
+                        out[(size_t) ent_dst[e + t] * L.n_embd + r] = v * sd;
+                    }
+                }
+            }
+        }
+    }
+}
+
 // Standalone zero-spill NVFP4 (type 40) down kernel for n_ff == 1152 (36 dots, 8 lanes/row, 32 rows/block, SMEM hq).
 __global__ void __launch_bounds__(256, 4) native_down_nvfp4_36_kernel(
     const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
@@ -4638,6 +4718,10 @@ void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, c
     if constexpr (TD == 40) {
         if (!g_old_kernels && !g_no_sub16_gu && L.n_ff == 1152) {
             native_down_nvfp4_36_kernel<<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+            return;
+        }
+        if (!g_old_kernels && !g_no_sub16_gu && L.n_ff == 576) {
+            native_down_nvfp4_18_kernel<<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
             return;
         }
     }
@@ -6829,6 +6913,101 @@ bool native_expert_expdec_takes(const NativeExpertLayout& L, bool& gu, bool& dow
     return gu || down;
 }
 
+
+// ============================================================================
+// AMD RDNA4 Zero-Group 2-Kernel T=1 Fused NVFP4 MoE (576 TP=2 & 1152 1-GPU)
+// ============================================================================
+__global__ void __launch_bounds__(256, 4) native_gu_nvfp4_72_situ_q8_1_t1_kernel(
+    const uint8_t* __restrict__ blobs, size_t stride, const int32_t* __restrict__ ids,
+    const block_q8_1* __restrict__ xq, NativeExpertLayout L, float beta, float lb,
+    block_q8_1* __restrict__ hq) {
+    __shared__ uint32_t s_xq_buf[72 * 9];
+    __shared__ float sh[32];
+    __shared__ float s_ue4m3[256];
+    s_ue4m3[threadIdx.x] = ue4m3_to_f32_half((uint8_t) threadIdx.x);
+    const uint32_t* src = reinterpret_cast<const uint32_t*>(xq);
+    for (int j = threadIdx.x; j < 72 * 9; j += 256) s_xq_buf[j] = src[j];
+    iq_sync_lds();
+
+    const int subwarp = threadIdx.x >> 3, t = threadIdx.x & 7;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int r = (int) blockIdx.x * 32 + subwarp;
+    const int k_idx = (int) blockIdx.y;
+    const uint8_t* blob = blobs + (size_t) ids[k_idx] * stride;
+    const float sg = L.tail_off ? ((const float*) (blob + L.tail_off))[0] : 1.0f;
+    const float su = L.tail_off ? ((const float*) (blob + L.tail_off))[1] : 1.0f;
+    const size_t g_off = (size_t) r * L.gu_row;
+    const size_t u_off = L.up_off + g_off;
+    const block_q8_1* s_xq = reinterpret_cast<const block_q8_1*>(s_xq_buf);
+
+    const int off1[1] = { 0 };
+    float s1[1];
+    row_dot_72_sub8<1, true>(blob + g_off, s_xq, off1, 1, t, s1, s_ue4m3);
+    const float gg = s1[0] * sg;
+    row_dot_72_sub8<1, true>(blob + u_off, s_xq, off1, 1, t, s1, s_ue4m3);
+    const float uu = s1[0] * su;
+    if (t == 0) {
+        const float tg = beta * tanhf(gg / beta) * (1.0f / (1.0f + __expf(-gg)));
+        const float tu = lb > 0.0f ? lb * tanhf(uu / lb) : uu;
+        sh[subwarp] = tg * tu;
+    }
+    iq_sync_lds();
+    if (warp == 0) {
+        q8_1_store(sh[lane], hq, (long long) k_idx * L.n_ff + (long long) blockIdx.x * 32 + lane);
+    }
+}
+
+__global__ void __launch_bounds__(128, 8) native_down_nvfp4_18_combine_t1_kernel(
+    const uint8_t* __restrict__ blobs, size_t stride, const int32_t* __restrict__ ids,
+    const float* __restrict__ ewts, int kp,
+    const block_q8_1* __restrict__ hq, NativeExpertLayout L, float* __restrict__ out_sum) {
+    __shared__ uint32_t s_hq_buf[8 * 18 * 9];
+    __shared__ float s_ue4m3[256];
+    __shared__ int32_t s_ids[8];
+    __shared__ float s_ewts[8];
+    s_ue4m3[threadIdx.x] = ue4m3_to_f32_half((uint8_t) threadIdx.x);
+    s_ue4m3[threadIdx.x + 128] = ue4m3_to_f32_half((uint8_t) (threadIdx.x + 128));
+    if (threadIdx.x < kp) {
+        s_ids[threadIdx.x] = ids[threadIdx.x];
+        s_ewts[threadIdx.x] = ewts[threadIdx.x];
+    }
+    const int words = kp * (18 * 9);
+    const uint32_t* src = reinterpret_cast<const uint32_t*>(hq);
+    for (int i = threadIdx.x; i < words; i += 128) s_hq_buf[i] = src[i];
+    iq_sync_lds();
+
+    const int r = blockIdx.x * 16 + (threadIdx.x >> 3);
+    const int t = threadIdx.x & 7;
+    if (r >= L.n_embd) return;
+    const size_t w_off = L.down_off + (size_t) r * L.d_row;
+    const block_q8_1* s_hq = reinterpret_cast<const block_q8_1*>(s_hq_buf);
+
+    float acc = 0.0f;
+    for (int k = 0; k < kp; ++k) {
+        const uint8_t* blob = blobs + (size_t) s_ids[k] * stride;
+        const float sd = L.tail_off ? ((const float*) (blob + L.tail_off))[2] : 1.0f;
+        const int off1[1] = { k * 18 };
+        float s1[1];
+        row_dot_18_sub8<1, true>(blob + w_off, s_hq, off1, 1, t, s1, s_ue4m3);
+        if (t == 0) acc += (s1[0] * sd) * s_ewts[k];
+    }
+    if (t == 0) out_sum[r] = acc;
+}
+
+bool native_expert_nvfp4_t1_fused(const NativeExpertLayout& L, const uint8_t* blobs, size_t stride,
+                                  const int32_t* ids, const float* ewts, int kp,
+                                  const void* x_q8_1, void* scratch, float* out_sum, void* stream) {
+    if (L.gu_type != 40 || L.d_type != 40 || L.n_embd != 2304 || L.n_ff != 576 || !L.situ ||
+        L.had_block != 0 || kp <= 0 || kp > 8) return false;
+    cudaStream_t s = (cudaStream_t) stream;
+    block_q8_1* hq = (block_q8_1*) scratch;
+    native_gu_nvfp4_72_situ_q8_1_t1_kernel<<<dim3(18, (unsigned) kp), 256, 0, s>>>(
+        blobs, stride, ids, (const block_q8_1*) x_q8_1, L, L.situ_beta, L.situ_linear_beta, hq);
+    native_down_nvfp4_18_combine_t1_kernel<<<dim3(144, 1), 128, 0, s>>>(
+        blobs, stride, ids, ewts, kp, hq, L, out_sum);
+    return true;
+}
+
 void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
@@ -7071,7 +7250,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     }
     if (g_exp_phase == 1) return;
     const bool tq_sub8 = (L.d_type == 144 || L.d_type == 146) && !g_old_kernels && !g_no_sub16_gu && L.n_ff == 640 && (tq_stage_on() || tq_sub8_on());   // the trellis down rows as 8-lane rows
-    const bool d_sub8_nvfp4_36 = !g_old_kernels && !g_no_sub16_gu && L.d_type == 40 && L.n_ff == 1152;
+    const bool d_sub8_nvfp4_36 = !g_old_kernels && !g_no_sub16_gu && L.d_type == 40 && (L.n_ff == 1152 || L.n_ff == 576);
     const int d_rows = d_sub8_nvfp4_36 ? 32 : ((!g_old_kernels && !g_no_sub16_gu && L.n_ff == 640) ? (L.d_type == 20 || L.d_type == 40 || tq_sub8 ? 32 : (L.d_type == 42 ? 16 : 8)) : 8);
     const int tq_ch = tq_sub8 ? tq_row_chunks() : 1;   // the staged trellis down kernel takes this many 32-row chunks a block
     const dim3 gd((unsigned) (((L.n_embd + d_rows - 1) / d_rows + tq_ch - 1) / tq_ch), (unsigned) gy);
@@ -8467,7 +8646,7 @@ bool native_expert_grouped_wmma(const NativeExpertLayout& L, const unsigned long
                                 int64_t cap_groups, int64_t cap_entries, const void* x_f16, void* scratch, float* out,
                                 void* stream, int64_t expected_entries) {
     if (cap_groups <= 0 || cap_entries <= 0 || L.had_block > 0 || L.gu_nib) return false;
-    if (L.n_embd % 256 != 0 || L.n_ff % 128 != 0) return false;
+    if (L.n_embd % 256 != 0 || L.n_ff % 64 != 0) return false;
     if (L.gu_type != 40 && L.gu_type != 12 && L.gu_type != 13 && L.gu_type != 8) return false;
     if (L.d_type != 40 && L.d_type != 8) return false;
 
@@ -8519,7 +8698,8 @@ bool native_expert_grouped_wmma(const NativeExpertLayout& L, const unsigned long
     __half* h16 = (__half*) ((uint8_t*) scratch + 2 * fa);
 
     const bool is_volta = (cc_volta[dev] != 0);
-    if (use_bm128 && (L.gu_type != 40 || is_volta)) {
+    const bool ff128 = (L.n_ff % 128 == 0);
+    if (use_bm128 && ff128 && (L.gu_type != 40 || is_volta)) {
         const dim3 ggu128((unsigned) (2 * L.n_ff / 128), (unsigned) ch_per_e128, (unsigned) cap_groups);
         if (L.gu_type == 40) {
             wmma_grouped_128_kernel<40, false><<<ggu128, 256, 0, s>>>(
@@ -8535,10 +8715,10 @@ bool native_expert_grouped_wmma(const NativeExpertLayout& L, const unsigned long
                 grp_ptr, grp_start, n_groups, ent_tok, (const __half*) x_f16, L, gate, up);
         }
     } else {
-        const int gu_bn = (L.gu_type == 40 && use_bn128) ? 128 : 64;
+        const int gu_bn = (L.gu_type == 40 && use_bn128 && ff128) ? 128 : 64;
         const dim3 ggu64((unsigned) (2 * L.n_ff / gu_bn), (unsigned) ch_per_e64, (unsigned) cap_groups);
         if (L.gu_type == 40) {
-            if (use_bn128) {
+            if (use_bn128 && ff128) {
                 wmma_grouped_64_kernel<40, false, 128><<<ggu64, 256, 0, s>>>(
                     grp_ptr, grp_start, n_groups, ent_tok, (const __half*) x_f16, L, gate, up);
             } else {

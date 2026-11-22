@@ -167,6 +167,96 @@ struct GpuWeightStore {
         return p;
     }
 
+    template <typename T>
+    T* peer_gpu_alloc(int pdev, size_t count) {
+        int cur = 0;
+        (void) cudaGetDevice(&cur);
+        CK(cudaSetDevice(pdev));
+        T* p = nullptr;
+        CK(cudaMalloc(&p, count * sizeof(T)));
+        peer_gpu_allocs.push_back({pdev, p});
+        CK(cudaSetDevice(cur));
+        return p;
+    }
+
+    float* upload_f32_slice(const char* name, int dev, size_t elem_start, size_t elem_count) {
+        const strata::TensorInfo* t = nullptr;
+        const uint8_t* raw = find_tensor(name, &t);
+        if (!raw || !t) {
+            std::fprintf(stderr, "strata-inkling2: missing tensor %s\n", name);
+            std::exit(1);
+        }
+        int cur = 0;
+        (void) cudaGetDevice(&cur);
+        float* d = (dev == cur) ? gpu_alloc<float>(elem_count) : peer_gpu_alloc<float>(dev, elem_count);
+        if (dev != cur) CK(cudaSetDevice(dev));
+        if (t->type == 0) {
+            CK(cudaMemcpy(d, reinterpret_cast<const float*>(raw) + elem_start, elem_count * sizeof(float), cudaMemcpyHostToDevice));
+        } else if (t->type == 30) {
+            std::vector<float> tmp(elem_count);
+            const uint16_t* b = reinterpret_cast<const uint16_t*>(raw) + elem_start;
+            for (size_t i = 0; i < elem_count; ++i) {
+                uint32_t u = (uint32_t) b[i] << 16;
+                std::memcpy(&tmp[i], &u, 4);
+            }
+            CK(cudaMemcpy(d, tmp.data(), elem_count * sizeof(float), cudaMemcpyHostToDevice));
+        } else {
+            std::fprintf(stderr, "strata-inkling2: unsupported F32 slice type %u on %s\n", t->type, name);
+            std::exit(1);
+        }
+        if (dev != cur) CK(cudaSetDevice(cur));
+        return d;
+    }
+
+    DenseMat upload_dense_slice(const char* name, int dev, int64_t row_start, int64_t row_count,
+                                bool col_split = false, int half_idx = 0) {
+        const strata::TensorInfo* t = nullptr;
+        const uint8_t* raw = find_tensor(name, &t);
+        if (!raw || !t || (t->type != 0 && t->type != 1 && t->type != 30 && !K::native_mmvq_supported((int) t->type))) {
+            std::fprintf(stderr, "strata-inkling2: missing/unsupported dense tensor %s (type=%u)\n", name, t ? t->type : 999u);
+            std::exit(1);
+        }
+        const int64_t ne0 = (int64_t) t->shape[0];
+        const int64_t ne1_full = t->shape.size() > 1 ? (int64_t) t->shape[1] : 1;
+        const int64_t ne1 = row_count > 0 ? row_count : ne1_full;
+        const size_t rb_full = (t->type == 0) ? (size_t) ne0 * sizeof(float)
+                             : (t->type == 1 || t->type == 30) ? (size_t) ne0 * sizeof(uint16_t)
+                             : strata::quant::row_bytes((int) t->type, ne0);
+        int cur = 0;
+        (void) cudaGetDevice(&cur);
+        if (!col_split) {
+            const size_t bytes = rb_full * (size_t) ne1;
+            uint8_t* d = (dev == cur) ? gpu_alloc<uint8_t>(bytes) : peer_gpu_alloc<uint8_t>(dev, bytes);
+            if (dev != cur) CK(cudaSetDevice(dev));
+            CK(cudaMemcpy(d, raw + (size_t) row_start * rb_full, bytes, cudaMemcpyHostToDevice));
+            if (dev != cur) CK(cudaSetDevice(cur));
+            if (t->type != 30 && t->type != 0 && t->type != 1) has_quant_dense = true;
+            return DenseMat{(int) t->type, ne0, ne1, d, bytes};
+        } else {
+            const int64_t ne0_half = ne0 / 2;
+            const size_t rb_half = (t->type == 0) ? (size_t) ne0_half * sizeof(float)
+                                 : (t->type == 1 || t->type == 30) ? (size_t) ne0_half * sizeof(uint16_t)
+                                 : strata::quant::row_bytes((int) t->type, ne0_half);
+            if (rb_half * 2 != rb_full) {
+                std::fprintf(stderr, "strata-inkling2: col_split mismatch on %s (rb_half=%zu rb_full=%zu)\n", name, rb_half, rb_full);
+                std::exit(1);
+            }
+            const size_t bytes = rb_half * (size_t) ne1;
+            std::vector<uint8_t> tmp(bytes);
+            const size_t col_off = half_idx ? rb_half : 0;
+            for (int64_t r = 0; r < ne1; ++r) {
+                std::memcpy(tmp.data() + (size_t) r * rb_half,
+                            raw + (size_t) (row_start + r) * rb_full + col_off, rb_half);
+            }
+            uint8_t* d = (dev == cur) ? gpu_alloc<uint8_t>(bytes) : peer_gpu_alloc<uint8_t>(dev, bytes);
+            if (dev != cur) CK(cudaSetDevice(dev));
+            CK(cudaMemcpy(d, tmp.data(), bytes, cudaMemcpyHostToDevice));
+            if (dev != cur) CK(cudaSetDevice(cur));
+            if (t->type != 30 && t->type != 0 && t->type != 1) has_quant_dense = true;
+            return DenseMat{(int) t->type, ne0_half, ne1, d, bytes};
+        }
+    }
+
     virtual const uint8_t* find_tensor(const char* name, const strata::TensorInfo** out = nullptr) const = 0;
 
     float* upload_f32(const char* name, size_t expected_elems = 0) {
@@ -244,8 +334,20 @@ struct GpuWeightStore {
     }
 };
 
+struct PeerAttnWeights {
+    DenseMat attn_q, attn_k, attn_v, attn_gate, attn_rel, attn_output;
+    DenseMat attn_sink_proj, attn_k_conv_proj, attn_v_conv_proj;
+    DenseMat attn_qgr, attn_qgrkv, attn_kkc, attn_vvc;
+    float* attn_q_clip = nullptr;
+    float* attn_rel_clip = nullptr;
+    float* attn_rel_bias = nullptr;
+    float* attn_k_conv = nullptr;
+    float* attn_v_conv = nullptr;
+};
+
 struct PhysLayer {
     bool is_swa = true;
+    PeerAttnWeights peer_attn;
     bool has_loop = false;
 
     // Dense projections on GPU (BF16 or native GGUF quantized)
@@ -290,6 +392,8 @@ struct PhysLayer {
     int gu_type = -1;
     int d_type = -1;
     size_t gu_row = 0;
+    size_t d_row_full = 0;
+    bool tp_moe = false;
     size_t d_row = 0;
     const uint8_t* h_gate_up = nullptr;
     const uint8_t* h_down = nullptr;
@@ -330,7 +434,13 @@ struct Model : GpuWeightStore {
     float* loop_kv_res_query = nullptr;
     float* output_res_query = nullptr;
     float* output_norm = nullptr;
-    DenseMat output_weight;                    // [vocab_unpadded, n_embd] in VRAM
+    DenseMat output_weight;                    // [vocab_unpadded (or vocab_tp0), n_embd] in VRAM
+    DenseMat peer_output_weight;               // [vocab_tp1, n_embd] on peer GPU when TP=2
+    int64_t vocab_tp0 = 0;
+    int64_t vocab_tp1 = 0;
+    int tp_peer_dev = -1;
+    bool tp_attn = false;
+    bool tp_moe = false;
 
     std::vector<PhysLayer> layers;
 
@@ -380,6 +490,29 @@ void build_expert_blob(const PhysLayer& L, int64_t e, uint8_t* dst) {
     }
 }
 
+void build_expert_blob_half(const PhysLayer& L, int64_t e, int half, uint8_t* dst) {
+    const int64_t n_ff_half = L.L.n_ff;
+    const int64_t n_ff_full = n_ff_half * 2;
+    const int64_t n_embd = L.L.n_embd;
+    const size_t gu_expert_bytes = (size_t) (2 * n_ff_full) * L.gu_row;
+    const size_t d_expert_bytes = (size_t) n_embd * L.d_row_full;
+    const uint8_t* gu_src = L.h_gate_up + (size_t) e * gu_expert_bytes;
+    const uint8_t* d_src = L.h_down + (size_t) e * d_expert_bytes;
+    std::memcpy(dst, gu_src + (size_t) (half * n_ff_half) * L.gu_row, (size_t) n_ff_half * L.gu_row);
+    std::memcpy(dst + L.L.up_off, gu_src + (size_t) (n_ff_full + half * n_ff_half) * L.gu_row, (size_t) n_ff_half * L.gu_row);
+    uint8_t* d_dst = dst + L.L.down_off;
+    const size_t d_off = (size_t) half * L.d_row;
+    for (int64_t r = 0; r < n_embd; ++r) {
+        std::memcpy(d_dst + (size_t) r * L.d_row, d_src + (size_t) r * L.d_row_full + d_off, L.d_row);
+    }
+    if (L.L.tail_off) {
+        const float sg = L.h_gu_scale ? L.h_gu_scale[e] : 1.0f;
+        const float sd = L.h_d_scale ? L.h_d_scale[e] : 1.0f;
+        const float tail[4] = {sg, sg, sd, 0.0f};
+        std::memcpy(dst + L.L.tail_off, tail, sizeof tail);
+    }
+}
+
 void build_all_expert_blobs(const PhysLayer& L, int ne, uint8_t* dst_base) {
     const int hw = (int) std::thread::hardware_concurrency();
     const int nt = std::clamp(hw > 0 ? hw : 4, 1, std::min(8, ne));
@@ -399,7 +532,7 @@ void build_all_expert_blobs(const PhysLayer& L, int ne, uint8_t* dst_base) {
     for (auto& th : ths) th.join();
 }
 
-bool load_model(const std::string& path, Model& m, std::string& err) {
+bool load_model(const std::string& path, Model& m, std::string& err, int peer_dev = -1, bool allow_tp_attn = false) {
     const auto t0 = Clock::now();
     try {
         m.gguf = std::make_unique<strata::GgufModel>(strata::gguf_split_paths(path));
@@ -489,7 +622,21 @@ bool load_model(const std::string& path, Model& m, std::string& err) {
     m.output_res_query = m.upload_f32("output_res_query.weight", (size_t) hp.n_embd);
     m.output_norm = m.upload_f32("output_norm.weight", (size_t) hp.n_embd);
     const bool pack_head = std::getenv("STRATA_Q8_HEAD_PACK") != nullptr && std::getenv("STRATA_Q8_HEAD_PACK")[0] == '1';
-    m.output_weight = m.upload_dense("output.weight", (size_t) hp.vocab_unpadded, (size_t) hp.n_embd, pack_head, false);
+    int cur_dev_lm = 0;
+    (void) cudaGetDevice(&cur_dev_lm);
+    if (peer_dev >= 0 && peer_dev != cur_dev_lm) {
+        m.tp_peer_dev = peer_dev;
+        m.tp_attn = allow_tp_attn && ((hp.n_head % 2) == 0) && ((hp.n_head_kv % 2) == 0) &&
+                    (std::getenv("STRATA_NO_TP_ATTN") == nullptr);
+        m.vocab_tp0 = ((hp.vocab_unpadded / 2) + 31) & ~31LL;
+        m.vocab_tp1 = hp.vocab_unpadded - m.vocab_tp0;
+        m.output_weight = m.upload_dense_slice("output.weight", cur_dev_lm, 0, m.vocab_tp0);
+        m.peer_output_weight = m.upload_dense_slice("output.weight", peer_dev, m.vocab_tp0, m.vocab_tp1);
+    } else {
+        m.vocab_tp0 = hp.vocab_unpadded;
+        m.vocab_tp1 = 0;
+        m.output_weight = m.upload_dense("output.weight", (size_t) hp.vocab_unpadded, (size_t) hp.n_embd, pack_head, false);
+    }
 
     m.layers.resize((size_t) hp.n_phys);
     char nm[128];
@@ -503,6 +650,106 @@ bool load_model(const std::string& path, Model& m, std::string& err) {
             std::snprintf(nm, sizeof nm, "blk.%d.%s", ip, suffix);
             return nm;
         };
+        if (m.tp_attn) {
+            const int64_t nh2 = hp.n_head / 2;
+            const int64_t nkv2 = hp.n_head_kv / 2;
+            const int64_t q2 = nh2 * hp.head_dim;
+            const int64_t kv2 = nkv2 * hp.head_dim;
+            const int64_t rel2 = nh2 * hp.n_rel;
+            const int64_t dyn2 = nkv2 * hp.n_conv;
+            const int d0 = cur_dev_lm, d1 = peer_dev;
+
+            auto upload_concat_half = [&](int dev, int half,
+                                          DenseMat& oq, DenseMat& og, DenseMat& orel, DenseMat& ok, DenseMat& ov,
+                                          DenseMat& oqgr, DenseMat& oqgrkv, DenseMat& okc, DenseMat& ovc,
+                                          DenseMat& okkc, DenseMat& ovvc) {
+                std::string sn_q = "blk." + std::to_string(ip) + ".attn_q.weight";
+                std::string sn_g = "blk." + std::to_string(ip) + ".attn_gate.weight";
+                std::string sn_r = "blk." + std::to_string(ip) + ".attn_rel.weight";
+                std::string sn_k = "blk." + std::to_string(ip) + ".attn_k.weight";
+                std::string sn_v = "blk." + std::to_string(ip) + ".attn_v.weight";
+                const strata::TensorInfo *tq = nullptr, *tg = nullptr, *tr = nullptr, *tk = nullptr, *tv = nullptr;
+                const uint8_t* raw_q = m.find_tensor(sn_q.c_str(), &tq);
+                const uint8_t* raw_g = m.find_tensor(sn_g.c_str(), &tg);
+                const uint8_t* raw_r = m.find_tensor(sn_r.c_str(), &tr);
+                const uint8_t* raw_k = m.find_tensor(sn_k.c_str(), &tk);
+                const uint8_t* raw_v = m.find_tensor(sn_v.c_str(), &tv);
+                const bool qgr_ok = raw_q && tq && raw_g && tg && raw_r && tr &&
+                                    tq->type == tg->type && tq->type == tr->type &&
+                                    tq->shape[0] == tg->shape[0] && tq->shape[0] == tr->shape[0] &&
+                                    tq->type != 0 && tq->type != 1 && tq->type != 30 && K::native_mmvq_supported((int) tq->type);
+                const bool kv_ok = qgr_ok && L.is_swa && raw_k && tk && raw_v && tv &&
+                                   tq->type == tk->type && tq->type == tv->type &&
+                                   tq->shape[0] == tk->shape[0] && tq->shape[0] == tv->shape[0];
+                const int64_t rq = half ? q2 : 0, rg = half ? q2 : 0, rr = half ? rel2 : 0;
+                const int64_t rk = half ? kv2 : 0, rv = half ? kv2 : 0, rd = half ? dyn2 : 0;
+                auto alloc_on = [&](size_t bytes) -> uint8_t* {
+                    return (dev == cur_dev_lm) ? m.gpu_alloc<uint8_t>(bytes) : m.peer_gpu_alloc<uint8_t>(dev, bytes);
+                };
+                if (kv_ok) {
+                    const int64_t nin = (int64_t) tq->shape[0];
+                    const size_t rb = strata::quant::row_bytes((int) tq->type, nin);
+                    const size_t bq = rb * (size_t) q2, bg = rb * (size_t) q2, br = rb * (size_t) rel2;
+                    const size_t bk = rb * (size_t) kv2, bv = rb * (size_t) kv2;
+                    uint8_t* dall = alloc_on(bq + bg + br + bk + bv);
+                    if (dev != cur_dev_lm) CK(cudaSetDevice(dev));
+                    CK(cudaMemcpy(dall, raw_q + (size_t) rq * rb, bq, cudaMemcpyHostToDevice));
+                    CK(cudaMemcpy(dall + bq, raw_g + (size_t) rg * rb, bg, cudaMemcpyHostToDevice));
+                    CK(cudaMemcpy(dall + bq + bg, raw_r + (size_t) rr * rb, br, cudaMemcpyHostToDevice));
+                    CK(cudaMemcpy(dall + bq + bg + br, raw_k + (size_t) rk * rb, bk, cudaMemcpyHostToDevice));
+                    CK(cudaMemcpy(dall + bq + bg + br + bk, raw_v + (size_t) rv * rb, bv, cudaMemcpyHostToDevice));
+                    if (dev != cur_dev_lm) CK(cudaSetDevice(cur_dev_lm));
+                    m.has_quant_dense = true;
+                    oq = DenseMat{(int) tq->type, nin, q2, dall, bq};
+                    og = DenseMat{(int) tg->type, nin, q2, dall + bq, bg};
+                    orel = DenseMat{(int) tr->type, nin, rel2, dall + bq + bg, br};
+                    ok = DenseMat{(int) tk->type, nin, kv2, dall + bq + bg + br, bk};
+                    ov = DenseMat{(int) tv->type, nin, kv2, dall + bq + bg + br + bk, bv};
+                    oqgr = DenseMat{(int) tq->type, nin, q2 + q2 + rel2, dall, bq + bg + br};
+                    oqgrkv = DenseMat{(int) tq->type, nin, q2 + q2 + rel2 + kv2 + kv2, dall, bq + bg + br + bk + bv};
+                } else {
+                    if (qgr_ok) {
+                        const int64_t nin = (int64_t) tq->shape[0];
+                        const size_t rb = strata::quant::row_bytes((int) tq->type, nin);
+                        const size_t bq = rb * (size_t) q2, bg = rb * (size_t) q2, br = rb * (size_t) rel2;
+                        uint8_t* dqgr = alloc_on(bq + bg + br);
+                        if (dev != cur_dev_lm) CK(cudaSetDevice(dev));
+                        CK(cudaMemcpy(dqgr, raw_q + (size_t) rq * rb, bq, cudaMemcpyHostToDevice));
+                        CK(cudaMemcpy(dqgr + bq, raw_g + (size_t) rg * rb, bg, cudaMemcpyHostToDevice));
+                        CK(cudaMemcpy(dqgr + bq + bg, raw_r + (size_t) rr * rb, br, cudaMemcpyHostToDevice));
+                        if (dev != cur_dev_lm) CK(cudaSetDevice(cur_dev_lm));
+                        m.has_quant_dense = true;
+                        oq = DenseMat{(int) tq->type, nin, q2, dqgr, bq};
+                        og = DenseMat{(int) tg->type, nin, q2, dqgr + bq, bg};
+                        orel = DenseMat{(int) tr->type, nin, rel2, dqgr + bq + bg, br};
+                        oqgr = DenseMat{(int) tq->type, nin, q2 + q2 + rel2, dqgr, bq + bg + br};
+                    } else {
+                        oq = m.upload_dense_slice(sn_q.c_str(), dev, rq, q2);
+                        og = m.upload_dense_slice(sn_g.c_str(), dev, rg, q2);
+                        orel = m.upload_dense_slice(sn_r.c_str(), dev, rr, rel2);
+                    }
+                    ok = m.upload_dense_slice(sn_k.c_str(), dev, rk, kv2);
+                    ov = m.upload_dense_slice(sn_v.c_str(), dev, rv, kv2);
+                    if (!L.is_swa) {
+                        std::string sn_kc = "blk." + std::to_string(ip) + ".attn_k_conv_proj.weight";
+                        std::string sn_vc = "blk." + std::to_string(ip) + ".attn_v_conv_proj.weight";
+                        okc = m.upload_dense_slice(sn_kc.c_str(), dev, rd, dyn2);
+                        ovc = m.upload_dense_slice(sn_vc.c_str(), dev, rd, dyn2);
+                    }
+                }
+            };
+            upload_concat_half(d0, 0, L.attn_q, L.attn_gate, L.attn_rel, L.attn_k, L.attn_v,
+                               L.attn_qgr, L.attn_qgrkv, L.attn_k_conv_proj, L.attn_v_conv_proj, L.attn_kkc, L.attn_vvc);
+            upload_concat_half(d1, 1, L.peer_attn.attn_q, L.peer_attn.attn_gate, L.peer_attn.attn_rel,
+                               L.peer_attn.attn_k, L.peer_attn.attn_v,
+                               L.peer_attn.attn_qgr, L.peer_attn.attn_qgrkv,
+                               L.peer_attn.attn_k_conv_proj, L.peer_attn.attn_v_conv_proj,
+                               L.peer_attn.attn_kkc, L.peer_attn.attn_vvc);
+            L.attn_output = m.upload_dense_slice(tn("attn_output.weight"), d0, 0, hp.n_embd, true, 0);
+            L.peer_attn.attn_output = m.upload_dense_slice(tn("attn_output.weight"), d1, 0, hp.n_embd, true, 1);
+            L.attn_sink_proj = m.upload_dense_slice(tn("attn_sink_proj.weight"), d0, 0, nh2);
+            L.peer_attn.attn_sink_proj = m.upload_dense_slice(tn("attn_sink_proj.weight"), d1, nh2, nh2);
+        } else {
         const char* nm_q = tn("attn_q.weight");
         const strata::TensorInfo* tq = nullptr;
         const uint8_t* raw_q = m.find_tensor(nm_q, &tq);
@@ -609,6 +856,7 @@ bool load_model(const std::string& path, Model& m, std::string& err) {
         }
         L.attn_output = m.upload_dense(tn("attn_output.weight"), 0, 0, false, pack_core);
         L.attn_sink_proj = m.upload_dense(tn("attn_sink_proj.weight"));
+        }
 
         if (L.is_swa) {
             L.attn_norm = m.upload_f32(tn("attn_norm.weight"), (size_t) hp.n_embd);
@@ -625,17 +873,50 @@ bool load_model(const std::string& path, Model& m, std::string& err) {
                 std::snprintf(s0, sizeof s0, "loop_%s_down.weight", mods[j]);
                 std::snprintf(s1, sizeof s1, "loop_%s_gain.weight", mods[j]);
                 std::snprintf(s2, sizeof s2, "loop_%s_forget.weight", mods[j]);
-                L.loop_down[j] = m.upload_dense(tn(s0));
-                L.loop_gain[j] = m.upload_dense(tn(s1));
-                L.loop_forget[j] = m.upload_dense(tn(s2));
+                auto upload_f16_ctrl = [&](const char* name) -> DenseMat {
+                    DenseMat dm = m.upload_dense(name);
+                    if (dm.type == 0 && dm.d && (std::getenv("STRATA_NO_CTRL_F16") == nullptr)) {
+                        const int64_t tot = (int64_t) (dm.bytes / sizeof(float));
+                        uint16_t* d16 = nullptr;
+                        CK(cudaMalloc(&d16, (size_t) tot * sizeof(uint16_t)));
+                        k_f32_to_f16<<<(unsigned) ((tot + 255) / 256), 256>>>((const float*) dm.d, d16, tot);
+                        CK(cudaDeviceSynchronize());
+                        // Free original F32 copy from gpu_allocs
+                        auto it = std::find(m.gpu_allocs.begin(), m.gpu_allocs.end(), dm.d);
+                        if (it != m.gpu_allocs.end()) m.gpu_allocs.erase(it);
+                        CK(cudaFree(dm.d));
+                        dm.d = d16;
+                        dm.type = 1; dm.bytes = (size_t) tot * sizeof(uint16_t);
+                        m.gpu_allocs.push_back(d16);
+                    }
+                    return dm;
+                };
+                L.loop_down[j] = upload_f16_ctrl(tn(s0));
+                L.loop_gain[j] = upload_f16_ctrl(tn(s1));
+                L.loop_forget[j] = upload_f16_ctrl(tn(s2));
             }
         }
 
-        L.attn_q_clip = m.upload_f32(tn("attn_q_clip.weight"), (size_t) hp.head_dim * hp.n_head);
-        L.attn_rel_clip = m.upload_f32(tn("attn_rel_clip.weight"), (size_t) hp.n_rel * hp.n_head);
-        L.attn_rel_bias = m.upload_f32(tn("attn_rel_bias.weight"), (size_t) hp.n_rel * hp.n_rel_ext);
-        L.attn_k_conv = m.upload_f32(tn("attn_k_conv.weight"), (size_t) hp.n_conv * hp.kv_dim);
-        L.attn_v_conv = m.upload_f32(tn("attn_v_conv.weight"), (size_t) hp.n_conv * hp.kv_dim);
+        if (m.tp_attn) {
+            const size_t nh2 = (size_t) (hp.n_head / 2);
+            const size_t kv2 = (size_t) (hp.kv_dim / 2);
+            L.attn_q_clip = m.upload_f32_slice(tn("attn_q_clip.weight"), cur_dev_lm, 0, (size_t) hp.head_dim * nh2);
+            L.peer_attn.attn_q_clip = m.upload_f32_slice(tn("attn_q_clip.weight"), peer_dev, (size_t) hp.head_dim * nh2, (size_t) hp.head_dim * nh2);
+            L.attn_rel_clip = m.upload_f32_slice(tn("attn_rel_clip.weight"), cur_dev_lm, 0, (size_t) hp.n_rel * nh2);
+            L.peer_attn.attn_rel_clip = m.upload_f32_slice(tn("attn_rel_clip.weight"), peer_dev, (size_t) hp.n_rel * nh2, (size_t) hp.n_rel * nh2);
+            L.attn_rel_bias = m.upload_f32(tn("attn_rel_bias.weight"), (size_t) hp.n_rel * hp.n_rel_ext);
+            L.peer_attn.attn_rel_bias = m.upload_f32_slice(tn("attn_rel_bias.weight"), peer_dev, 0, (size_t) hp.n_rel * hp.n_rel_ext);
+            L.attn_k_conv = m.upload_f32_slice(tn("attn_k_conv.weight"), cur_dev_lm, 0, (size_t) hp.n_conv * kv2);
+            L.peer_attn.attn_k_conv = m.upload_f32_slice(tn("attn_k_conv.weight"), peer_dev, (size_t) hp.n_conv * kv2, (size_t) hp.n_conv * kv2);
+            L.attn_v_conv = m.upload_f32_slice(tn("attn_v_conv.weight"), cur_dev_lm, 0, (size_t) hp.n_conv * kv2);
+            L.peer_attn.attn_v_conv = m.upload_f32_slice(tn("attn_v_conv.weight"), peer_dev, (size_t) hp.n_conv * kv2, (size_t) hp.n_conv * kv2);
+        } else {
+            L.attn_q_clip = m.upload_f32(tn("attn_q_clip.weight"), (size_t) hp.head_dim * hp.n_head);
+            L.attn_rel_clip = m.upload_f32(tn("attn_rel_clip.weight"), (size_t) hp.n_rel * hp.n_head);
+            L.attn_rel_bias = m.upload_f32(tn("attn_rel_bias.weight"), (size_t) hp.n_rel * hp.n_rel_ext);
+            L.attn_k_conv = m.upload_f32(tn("attn_k_conv.weight"), (size_t) hp.n_conv * hp.kv_dim);
+            L.attn_v_conv = m.upload_f32(tn("attn_v_conv.weight"), (size_t) hp.n_conv * hp.kv_dim);
+        }
         L.attn_post_conv = m.upload_f32(tn("attn_post_conv.weight"), (size_t) hp.n_conv * hp.n_embd);
         L.ffn_post_conv = m.upload_f32(tn("ffn_post_conv.weight"), (size_t) hp.n_conv * hp.n_embd);
         if (ip > 0) L.attn_res_query = m.upload_f32(tn("attn_res_query.weight"), (size_t) hp.n_embd * (L.is_swa ? 1 : 3));
@@ -673,13 +954,28 @@ bool load_model(const std::string& path, Model& m, std::string& err) {
                 err = "unsupported expert format in layer " + std::to_string(ip);
                 return false;
             }
-            L.L = K::native_expert_layout(L.gu_type, L.d_type, hp.n_embd, hp.n_ff);
+            size_t free0_chk = 0, tot0_chk = 0;
+            (void) cudaMemGetInfo(&free0_chk, &tot0_chk);
+            const bool can_tp_moe = m.tp_attn && (free0_chk >= ((size_t) 8500 << 20)) && ((hp.n_ff & 1) == 0) &&
+                (std::getenv("STRATA_NO_TP_MOE") == nullptr) &&
+                K::native_expert_supported(L.gu_type, L.d_type, hp.n_embd, hp.n_ff / 2);
+            if (can_tp_moe) {
+                const auto Lfull = K::native_expert_layout(L.gu_type, L.d_type, hp.n_embd, hp.n_ff);
+                L.L = K::native_expert_layout(L.gu_type, L.d_type, hp.n_embd, hp.n_ff / 2);
+                L.d_row_full = Lfull.d_row;
+                L.tp_moe = true;
+                m.tp_moe = true;
+            } else {
+                L.L = K::native_expert_layout(L.gu_type, L.d_type, hp.n_embd, hp.n_ff);
+                L.d_row_full = L.L.d_row;
+            }
         }
         L.L.situ = true;
         L.L.situ_beta = hp.situ_beta;
         L.L.situ_linear_beta = hp.situ_linear_beta;
         L.gu_row = L.L.gu_row;
         L.d_row = L.L.d_row;
+        if (L.d_row_full == 0) L.d_row_full = L.d_row;
         L.stride = (L.L.bytes + 255) & ~(size_t) 255;
 
 #if defined(STRATA_INKLING2_CPU_POOL)
@@ -839,6 +1135,16 @@ struct Engine {
     double p_embd_ms = 0, p_attn_ms = 0, p_moe_gpu_ms = 0, p_moe_wait_ms = 0, p_moe_cpu_ms = 0;
     double p_moe_up_ms = 0, p_moe_post_ms = 0, p_core_ms = 0, p_head_ms = 0, p_rebal_ms = 0;
     double p_d_mix = 0, p_d_qkv = 0, p_d_attn = 0, p_d_out = 0, p_d_route = 0, p_d_moe_gpu_core = 0, p_d_moe_gpu_nv = 0, p_d_moe_gpu_q5 = 0;
+    int ev_prof_step = 0;
+    bool ev_prof_en = (std::getenv("STRATA_EV_PROF") != nullptr);
+    cudaEvent_t ev_t[64][8]{};
+    bool ev_init = false;
+    void ev_ensure() {
+        if (ev_init) return;
+        for (int i = 0; i < 64; ++i) for (int j = 0; j < 8; ++j) cudaEventCreate(&ev_t[i][j]);
+        ev_init = true;
+    }
+
     double p_d_cpu_nv = 0, p_d_cpu_q5 = 0;
     int64_t p_miss_nv = 0, p_miss_q5 = 0, p_hit_nv = 0, p_hit_q5 = 0;
     int p_calls = 0;
@@ -909,9 +1215,75 @@ struct Engine {
         float* h_sum = nullptr;
 
         float* d_peer_sum = nullptr;
+        float* logits = nullptr;
+        float* argmax_val = nullptr;
+        int32_t* argmax_idx = nullptr;
+        int32_t* pick_d = nullptr;
+        int64_t logits_cap = 0;
+        // TP=2 Attention + KV Cache on peer GPU
+        bool tp_attn = false;
+        strata::prefill::Gemm gemm;
+        cudaEvent_t ev_attn_go = nullptr;    // on primary_dev
+        cudaEvent_t ev_attn_done = nullptr;  // on peer dev
+        int32_t* pos0_d = nullptr;
+        float* in_q = nullptr;
+        float* in_k = nullptr;
+        float* in_v = nullptr;
+        void* xq_k = nullptr;
+        void* xq_v = nullptr;
+        uint16_t* act_f16_k = nullptr;
+        float* Q = nullptr;
+        float* K = nullptr;
+        float* V = nullptr;
+        float* att_gate = nullptr;
+        float* R = nullptr;
+        float* sink = nullptr;
+        float* dyn_k = nullptr;
+        float* dyn_v = nullptr;
+        float* qgr_t1 = nullptr;
+        float* K_conv = nullptr;
+        float* V_conv = nullptr;
+        float* rel_tab = nullptr;
+        float* att = nullptr;
+        void* att_xq = nullptr;
+        float* attn_split = nullptr;
+        float* wo = nullptr;
+        float* d_wo_peer = nullptr;
+        int attn_split_slots = 0;
+        std::vector<int8_t*> kq, vq;
+        std::vector<__half*> ks, vs;
+        float* conv_hist_pool = nullptr;
+        std::vector<float*> conv_hist;
+        size_t conv_floats_layer = 0;
+        // FineGrained P2P spin-barrier buffers + Dual hipGraph (T=1 decode)
+        bool fg_ready = false;
+        uint32_t* fg_flag0 = nullptr;         // on primary_dev (GPU1 pushes, GPU0 spins)
+        float* fg_wo_from_peer = nullptr;     // on primary_dev
+        float* fg_moe_from_peer = nullptr;    // on primary_dev
+        float* fg_head_val = nullptr;         // on primary_dev
+        int32_t* fg_head_idx = nullptr;       // on primary_dev
+        uint32_t* fg_flag1 = nullptr;         // on peer dev (GPU0 pushes, GPU1 spins)
+        float* fg_in_q = nullptr;             // on peer dev
+        float* fg_in_k = nullptr;             // on peer dev
+        float* fg_in_v = nullptr;             // on peer dev
+        void* fg_xq_q = nullptr;              // on peer dev
+        void* fg_xq_k = nullptr;              // on peer dev
+        void* fg_xq_v = nullptr;              // on peer dev
+        int32_t* fg_ids = nullptr;            // on peer dev
+        float* fg_ewts = nullptr;             // on peer dev
+        cudaGraphExec_t tp_graph0 = nullptr;  // on primary_dev
+        cudaGraphExec_t tp_graph1 = nullptr;  // on peer dev
 
         void destroy() {
             if (d_peer_sum) { (void) cudaSetDevice(primary_dev); (void) cudaFree(d_peer_sum); d_peer_sum = nullptr; }
+            if (d_wo_peer) { (void) cudaSetDevice(primary_dev); (void) cudaFree(d_wo_peer); d_wo_peer = nullptr; }
+            if (ev_attn_go) { (void) cudaSetDevice(primary_dev); (void) cudaEventDestroy(ev_attn_go); ev_attn_go = nullptr; }
+            if (tp_graph0) { (void) cudaSetDevice(primary_dev); (void) cudaGraphExecDestroy(tp_graph0); tp_graph0 = nullptr; }
+            if (fg_flag0) { (void) cudaSetDevice(primary_dev); (void) cudaFree(fg_flag0); fg_flag0 = nullptr; }
+            if (fg_wo_from_peer) { (void) cudaSetDevice(primary_dev); (void) cudaFree(fg_wo_from_peer); fg_wo_from_peer = nullptr; }
+            if (fg_moe_from_peer) { (void) cudaSetDevice(primary_dev); (void) cudaFree(fg_moe_from_peer); fg_moe_from_peer = nullptr; }
+            if (fg_head_val) { (void) cudaSetDevice(primary_dev); (void) cudaFree(fg_head_val); fg_head_val = nullptr; }
+            if (fg_head_idx) { (void) cudaSetDevice(primary_dev); (void) cudaFree(fg_head_idx); fg_head_idx = nullptr; }
             if (h_x) { (void) cudaFreeHost(h_x); h_x = nullptr; }
             if (h_ids) { (void) cudaFreeHost(h_ids); h_ids = nullptr; }
             if (h_ewts) { (void) cudaFreeHost(h_ewts); h_ewts = nullptr; }
@@ -931,6 +1303,49 @@ struct Engine {
                 if (escr) cudaFree(escr);
                 if (eparts) cudaFree(eparts);
                 if (sum_out) cudaFree(sum_out);
+                if (logits) cudaFree(logits);
+                if (argmax_val) cudaFree(argmax_val);
+                if (argmax_idx) cudaFree(argmax_idx);
+                if (pick_d) cudaFree(pick_d);
+                if (pos0_d) cudaFree(pos0_d);
+                if (in_q) cudaFree(in_q);
+                if (in_k) cudaFree(in_k);
+                if (in_v) cudaFree(in_v);
+                if (xq_k) cudaFree(xq_k);
+                if (xq_v) cudaFree(xq_v);
+                if (act_f16_k) cudaFree(act_f16_k);
+                if (Q) cudaFree(Q);
+                if (K) cudaFree(K);
+                if (V) cudaFree(V);
+                if (att_gate) cudaFree(att_gate);
+                if (R) cudaFree(R);
+                if (sink) cudaFree(sink);
+                if (dyn_k) cudaFree(dyn_k);
+                if (dyn_v) cudaFree(dyn_v);
+                if (qgr_t1) cudaFree(qgr_t1);
+                if (K_conv) cudaFree(K_conv);
+                if (V_conv) cudaFree(V_conv);
+                if (rel_tab) cudaFree(rel_tab);
+                if (att) cudaFree(att);
+                if (att_xq) cudaFree(att_xq);
+                if (attn_split) cudaFree(attn_split);
+                if (wo) cudaFree(wo);
+                if (conv_hist_pool) cudaFree(conv_hist_pool);
+                for (auto* p_ : kq) if (p_) cudaFree(p_);
+                for (auto* p_ : vq) if (p_) cudaFree(p_);
+                for (auto* p_ : ks) if (p_) cudaFree(p_);
+                for (auto* p_ : vs) if (p_) cudaFree(p_);
+                if (ev_attn_done) cudaEventDestroy(ev_attn_done);
+                if (tp_graph1) cudaGraphExecDestroy(tp_graph1);
+                if (fg_flag1) cudaFree(fg_flag1);
+                if (fg_in_q) cudaFree(fg_in_q);
+                if (fg_in_k) cudaFree(fg_in_k);
+                if (fg_in_v) cudaFree(fg_in_v);
+                if (fg_xq_q) cudaFree(fg_xq_q);
+                if (fg_xq_k) cudaFree(fg_xq_k);
+                if (fg_xq_v) cudaFree(fg_xq_v);
+                if (fg_ids) cudaFree(fg_ids);
+                if (fg_ewts) cudaFree(fg_ewts);
                 if (ev_done) cudaEventDestroy(ev_done);
                 if (st) cudaStreamDestroy(st);
                 (void) cudaSetDevice(primary_dev);
@@ -939,6 +1354,13 @@ struct Engine {
             ids = nullptr; ewts = nullptr; grp_ptr = nullptr; grp_start = nullptr;
             n_groups = nullptr; ent_dst = nullptr; ent_tok = nullptr;
             escr = nullptr; eparts = nullptr; sum_out = nullptr;
+            logits = nullptr; argmax_val = nullptr; argmax_idx = nullptr; pick_d = nullptr; logits_cap = 0;
+            tp_attn = false; ev_attn_done = nullptr; pos0_d = nullptr;
+            in_q = in_k = in_v = nullptr; xq_k = xq_v = nullptr; act_f16_k = nullptr;
+            Q = K = V = att_gate = R = sink = dyn_k = dyn_v = qgr_t1 = K_conv = V_conv = rel_tab = att = attn_split = wo = nullptr;
+            att_xq = nullptr; conv_hist_pool = nullptr; kq.clear(); vq.clear(); ks.clear(); vs.clear(); conv_hist.clear();
+            fg_ready = false; tp_graph1 = nullptr; fg_flag1 = nullptr;
+            fg_in_q = fg_in_k = fg_in_v = nullptr; fg_xq_q = fg_xq_k = fg_xq_v = nullptr; fg_ids = nullptr; fg_ewts = nullptr;
             ev_done = nullptr; st = nullptr; dev = -1; p2p = false;
         }
 
@@ -992,6 +1414,11 @@ struct Engine {
             CK(cudaMalloc(&escr, escr_bytes));
             CK(cudaMalloc(&eparts, (size_t) max_ent * (size_t) N * sizeof(float)));
             CK(cudaMalloc(&sum_out, (size_t) tmax * (size_t) N * sizeof(float)));
+            logits_cap = ((hp.vocab_unpadded / 2) + 64);
+            CK(cudaMalloc(&logits, (size_t) 8 * (size_t) logits_cap * sizeof(float)));
+            CK(cudaMalloc(&argmax_val, (size_t) 8 * 64 * sizeof(float)));
+            CK(cudaMalloc(&argmax_idx, (size_t) 8 * 64 * sizeof(int32_t)));
+            CK(cudaMalloc(&pick_d, (size_t) 8 * sizeof(int32_t)));
 
             CK(cudaSetDevice(primary_dev));
             CK(cudaMalloc(&d_peer_sum, (size_t) tmax * (size_t) N * sizeof(float)));
@@ -1002,6 +1429,95 @@ struct Engine {
                 CK(cudaHostAlloc(&h_sum, (size_t) tmax * (size_t) N * sizeof(float), cudaHostAllocDefault));
             }
             return true;
+        }
+
+        void init_tp_attn(const Hparams& hp, int tmax, const std::vector<int>& kv_cap_in, int split_slots) {
+            if (dev < 0) return;
+            tp_attn = true;
+            const int64_t N = hp.n_embd;
+            const int64_t nh2 = hp.n_head / 2;
+            const int64_t nkv2 = hp.n_head_kv / 2;
+            const int64_t q2 = nh2 * hp.head_dim;
+            const int64_t kv2 = nkv2 * hp.head_dim;
+            const int64_t rel2 = nh2 * hp.n_rel;
+            const int64_t dyn2 = nkv2 * hp.n_conv;
+            attn_split_slots = split_slots;
+
+            CK(cudaSetDevice(primary_dev));
+            CK(cudaEventCreateWithFlags(&ev_attn_go, cudaEventDisableTiming));
+            CK(cudaMalloc(&d_wo_peer, (size_t) tmax * (size_t) N * sizeof(float)));
+
+            CK(cudaSetDevice(dev));
+            CK(cudaEventCreateWithFlags(&ev_attn_done, cudaEventDisableTiming));
+            std::string gerr;
+            gemm.init(st, (size_t) (8 * 1024 * 1024), gerr);
+            CK(cudaMalloc(&pos0_d, sizeof(int32_t)));
+            CK(cudaMalloc(&in_q, (size_t) tmax * (size_t) N * sizeof(float)));
+            CK(cudaMalloc(&in_k, (size_t) tmax * (size_t) N * sizeof(float)));
+            CK(cudaMalloc(&in_v, (size_t) tmax * (size_t) N * sizeof(float)));
+            const size_t xq_b = (size_t) tmax * ((size_t) N / 32) * 36;
+            CK(cudaMalloc(&xq_k, xq_b));
+            CK(cudaMalloc(&xq_v, xq_b));
+            CK(cudaMalloc(&act_f16_k, (size_t) tmax * (size_t) N * sizeof(uint16_t)));
+            CK(cudaMalloc(&Q, (size_t) tmax * (size_t) q2 * sizeof(float)));
+            CK(cudaMalloc(&K, (size_t) tmax * (size_t) kv2 * sizeof(float)));
+            CK(cudaMalloc(&V, (size_t) tmax * (size_t) kv2 * sizeof(float)));
+            CK(cudaMalloc(&att_gate, (size_t) tmax * (size_t) q2 * sizeof(float)));
+            CK(cudaMalloc(&R, (size_t) tmax * (size_t) rel2 * sizeof(float)));
+            CK(cudaMalloc(&sink, (size_t) tmax * (size_t) nh2 * sizeof(float)));
+            CK(cudaMalloc(&dyn_k, (size_t) tmax * (size_t) dyn2 * sizeof(float)));
+            CK(cudaMalloc(&dyn_v, (size_t) tmax * (size_t) dyn2 * sizeof(float)));
+            CK(cudaMalloc(&qgr_t1, (size_t) (2 * q2 + rel2 + 2 * kv2 + 2 * dyn2) * sizeof(float)));
+            CK(cudaMalloc(&K_conv, (size_t) tmax * (size_t) kv2 * sizeof(float)));
+            CK(cudaMalloc(&V_conv, (size_t) tmax * (size_t) kv2 * sizeof(float)));
+            CK(cudaMalloc(&rel_tab, (size_t) tmax * (size_t) nh2 * (size_t) hp.n_rel_ext * sizeof(float)));
+            CK(cudaMalloc(&att, (size_t) tmax * (size_t) q2 * sizeof(float)));
+            CK(cudaMalloc(&att_xq, (size_t) tmax * ((size_t) std::max<int64_t>(q2, N) / 32) * 36));
+            CK(cudaMalloc(&attn_split, (size_t) nh2 * (size_t) split_slots * 130 * sizeof(float)));
+            CK(cudaMalloc(&wo, (size_t) tmax * (size_t) N * sizeof(float)));
+
+            conv_floats_layer = (size_t) (2 * kv2) * 3;
+            CK(cudaMalloc(&conv_hist_pool, (size_t) hp.n_layer * conv_floats_layer * sizeof(float)));
+            CK(cudaMemsetAsync(conv_hist_pool, 0, (size_t) hp.n_layer * conv_floats_layer * sizeof(float), st));
+            conv_hist.resize((size_t) hp.n_layer);
+            kq.resize((size_t) hp.n_layer, nullptr);
+            vq.resize((size_t) hp.n_layer, nullptr);
+            ks.resize((size_t) hp.n_layer, nullptr);
+            vs.resize((size_t) hp.n_layer, nullptr);
+            for (int il = 0; il < hp.n_layer; ++il) {
+                const int cap = kv_cap_in[(size_t) il];
+                CK(cudaMalloc(&kq[(size_t) il], (size_t) cap * (size_t) kv2 * sizeof(int8_t)));
+                CK(cudaMalloc(&vq[(size_t) il], (size_t) cap * (size_t) kv2 * sizeof(int8_t)));
+                CK(cudaMalloc(&ks[(size_t) il], (size_t) cap * (size_t) nkv2 * sizeof(__half)));
+                CK(cudaMalloc(&vs[(size_t) il], (size_t) cap * (size_t) nkv2 * sizeof(__half)));
+                conv_hist[(size_t) il] = conv_hist_pool + (size_t) il * conv_floats_layer;
+            }
+#if defined(__HIP_PLATFORM_AMD__)
+            if (p2p && (std::getenv("STRATA_NO_P2P_SPIN") == nullptr)) {
+                const size_t x1_b = (size_t) N * sizeof(float);
+                const size_t q1_b = ((size_t) N / 32) * 36;
+                CK(hipSetDevice(primary_dev));
+                CK(hipExtMallocWithFlags((void**) &fg_flag0, sizeof(uint32_t), hipDeviceMallocFinegrained));
+                CK(hipExtMallocWithFlags((void**) &fg_wo_from_peer, x1_b, hipDeviceMallocFinegrained));
+                CK(hipExtMallocWithFlags((void**) &fg_moe_from_peer, x1_b, hipDeviceMallocFinegrained));
+                CK(hipExtMallocWithFlags((void**) &fg_head_val, sizeof(float), hipDeviceMallocFinegrained));
+                CK(hipExtMallocWithFlags((void**) &fg_head_idx, sizeof(int32_t), hipDeviceMallocFinegrained));
+                CK(hipMemset(fg_flag0, 0, sizeof(uint32_t)));
+                CK(hipSetDevice(dev));
+                CK(hipExtMallocWithFlags((void**) &fg_flag1, sizeof(uint32_t), hipDeviceMallocFinegrained));
+                CK(hipExtMallocWithFlags((void**) &fg_in_q, x1_b, hipDeviceMallocFinegrained));
+                CK(hipExtMallocWithFlags((void**) &fg_in_k, x1_b, hipDeviceMallocFinegrained));
+                CK(hipExtMallocWithFlags((void**) &fg_in_v, x1_b, hipDeviceMallocFinegrained));
+                CK(hipExtMallocWithFlags((void**) &fg_xq_q, q1_b, hipDeviceMallocFinegrained));
+                CK(hipExtMallocWithFlags((void**) &fg_xq_k, q1_b, hipDeviceMallocFinegrained));
+                CK(hipExtMallocWithFlags((void**) &fg_xq_v, q1_b, hipDeviceMallocFinegrained));
+                CK(hipExtMallocWithFlags((void**) &fg_ids, (size_t) hp.n_expert_used * sizeof(int32_t), hipDeviceMallocFinegrained));
+                CK(hipExtMallocWithFlags((void**) &fg_ewts, (size_t) hp.n_expert_used * sizeof(float), hipDeviceMallocFinegrained));
+                CK(hipMemset(fg_flag1, 0, sizeof(uint32_t)));
+                fg_ready = true;
+            }
+#endif
+            CK(cudaSetDevice(primary_dev));
         }
     } peer;
 
@@ -1181,10 +1697,12 @@ struct Engine {
             const int cap = hp.is_swa(il) ? swa_kv_cap : full_kv_cap;
             kv_cap[(size_t) il] = cap;
             if (kv_q8) {
-                CK(cudaMalloc(&kq[(size_t) il], (size_t) cap * hp.kv_dim * sizeof(int8_t)));
-                CK(cudaMalloc(&vq[(size_t) il], (size_t) cap * hp.kv_dim * sizeof(int8_t)));
-                CK(cudaMalloc(&ks[(size_t) il], (size_t) cap * hp.n_head_kv * sizeof(__half)));
-                CK(cudaMalloc(&vs[(size_t) il], (size_t) cap * hp.n_head_kv * sizeof(__half)));
+                const int64_t kvd = m->tp_attn ? (hp.kv_dim / 2) : hp.kv_dim;
+                const int64_t nkvh = m->tp_attn ? (hp.n_head_kv / 2) : hp.n_head_kv;
+                CK(cudaMalloc(&kq[(size_t) il], (size_t) cap * (size_t) kvd * sizeof(int8_t)));
+                CK(cudaMalloc(&vq[(size_t) il], (size_t) cap * (size_t) kvd * sizeof(int8_t)));
+                CK(cudaMalloc(&ks[(size_t) il], (size_t) cap * (size_t) nkvh * sizeof(__half)));
+                CK(cudaMalloc(&vs[(size_t) il], (size_t) cap * (size_t) nkvh * sizeof(__half)));
             } else {
                 CK(cudaMalloc(&kc[(size_t) il], (size_t) cap * hp.kv_dim * sizeof(__half)));
                 CK(cudaMalloc(&vc[(size_t) il], (size_t) cap * hp.kv_dim * sizeof(__half)));
@@ -1250,6 +1768,9 @@ struct Engine {
         }
         attn_split_t1_full = std::clamp((sm_count * profile.t1_full_split_mult) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax);
         attn_split_t1_swa = std::clamp((sm_count * profile.t1_swa_split_mult) / std::max(1, (int) hp.n_head_kv), 8, 24);
+#if defined(__HIP_PLATFORM_AMD__)
+        attn_split_t1_swa = std::max(attn_split_t1_swa, 12);
+#endif
         // Configure dynamic shared memory for WMMA kernels upfront (required before CUDA Graph capture).
 #if defined(__HIP_PLATFORM_AMD__)
         (void) max_smem_optin;
@@ -1421,6 +1942,11 @@ struct Engine {
     void reset_state() {
         pos = 0;
         CK(cudaMemsetAsync(conv_hist_pool, 0, (size_t) m->hp.n_layer * layer_conv_floats * sizeof(float), st));
+        if (peer.tp_attn && peer.conv_hist_pool) {
+            CK(cudaSetDevice(peer.dev));
+            CK(cudaMemsetAsync(peer.conv_hist_pool, 0, (size_t) m->hp.n_layer * peer.conv_floats_layer * sizeof(float), peer.st));
+            CK(cudaSetDevice(peer.primary_dev));
+        }
         if (dspark) dspark->reset(st);
     }
 
@@ -1467,6 +1993,92 @@ struct Engine {
         if (T <= 8 && (K_in % 32) == 0) {
             K::native_quantize_q8_1(X, q8_buf, (int) K_in, T, st);
         }
+    }
+
+    void project_preq_on(cudaStream_t stream, strata::prefill::Gemm& gctx, void* xq_scratch, uint16_t* f16_scratch,
+                         const float* X, const void* q8_ready, const DenseMat& W, float* Y, int T, int64_t N_out, int64_t K_in,
+                         const uint16_t* f16_ready = nullptr) {
+        if (W.type == 0) {
+            if (T == 1 && (K_in % 4) == 0) {
+                if (N_out <= 128) k_gemv_f32_cta<<<(unsigned) N_out, 128, 0, stream>>>((const float*) W.d, X, Y, (int) K_in, (int) N_out);
+                else k_gemv_f32<<<(unsigned) ((N_out + 7) / 8), 256, 0, stream>>>((const float*) W.d, X, Y, (int) K_in, (int) N_out);
+            } else {
+                k_gemm_f32_smallT_warp<8, false><<<(unsigned) ((N_out + 7) / 8), 256, 0, stream>>>((const float*) W.d, X, Y, (int) K_in, (int) N_out, T);
+            }
+            return;
+        }
+        if (W.type == 1 || W.type == 30) {
+            const uint16_t* wp = (const uint16_t*) W.d;
+            if (T >= 1 && T <= 8 && (K_in % 4) == 0 && ((((uintptr_t) wp) & 7u) == 0u) && ((((uintptr_t) X) & 15u) == 0u)) {
+                if (W.type == 1) {
+                    if (N_out <= 128) {
+                        if (T == 1) k_gemm_f16_smallT_cta<1, true><<<(unsigned) N_out, 256, 0, stream>>>(wp, X, Y, (int) K_in, (int) N_out, 1);
+                        else k_gemm_f16_smallT_cta<8, false><<<(unsigned) N_out, 256, 0, stream>>>(wp, X, Y, (int) K_in, (int) N_out, T);
+                    } else {
+                        const unsigned nb = (unsigned) ((N_out + 7) / 8);
+                        if (T == 1) k_gemm_f16_smallT_warp<1, true><<<nb, 256, 0, stream>>>(wp, X, Y, (int) K_in, (int) N_out, 1);
+                        else k_gemm_f16_smallT_warp<8, false><<<nb, 256, 0, stream>>>(wp, X, Y, (int) K_in, (int) N_out, T);
+                    }
+                } else {
+                    if (N_out <= 128) {
+                        if (T == 1) k_gemm_bf16_smallT_cta<1, true><<<(unsigned) N_out, 256, 0, stream>>>(wp, X, Y, (int) K_in, (int) N_out, 1);
+                        else k_gemm_bf16_smallT_cta<8, false><<<(unsigned) N_out, 256, 0, stream>>>(wp, X, Y, (int) K_in, (int) N_out, T);
+                    } else {
+                        const unsigned nb = (unsigned) ((N_out + 7) / 8);
+                        if (T == 1) k_gemm_bf16_smallT_warp<1, true><<<nb, 256, 0, stream>>>(wp, X, Y, (int) K_in, (int) N_out, 1);
+                        else k_gemm_bf16_smallT_warp<8, false><<<nb, 256, 0, stream>>>(wp, X, Y, (int) K_in, (int) N_out, T);
+                    }
+                }
+                return;
+            }
+            if (W.type == 1) {
+                const uint16_t* xf16 = f16_ready;
+                if (!xf16) {
+                    const int64_t tot = (int64_t) T * K_in;
+                    k_f32_to_f16<<<(unsigned) ((tot + 255) / 256), 256, 0, stream>>>(X, f16_scratch, tot);
+                    xf16 = f16_scratch;
+                }
+                gctx.f16(xf16, wp, Y, T, N_out, K_in);
+            } else if (bf16_x_f16) {
+                const uint16_t* xf16 = f16_ready;
+                if (!xf16) {
+                    const int64_t tot = (int64_t) T * K_in;
+                    k_f32_to_f16<<<(unsigned) ((tot + 255) / 256), 256, 0, stream>>>(X, f16_scratch, tot);
+                    xf16 = f16_scratch;
+                }
+                gctx.bf16(xf16, wp, Y, T, N_out, K_in, 0, 0.0f, 0, true);
+            } else {
+                const int64_t tot = (int64_t) T * K_in;
+                k_f32_to_bf16<<<(unsigned) ((tot + 255) / 256), 256, 0, stream>>>(X, f16_scratch, tot);
+                gctx.bf16(f16_scratch, wp, Y, T, N_out, K_in);
+            }
+            return;
+        }
+        if (T <= 8) {
+            const void* xq_ptr = q8_ready;
+            if (!xq_ptr) {
+                K::quantize_q8_1_rows(X, T, (int) K_in, xq_scratch, stream);
+                xq_ptr = xq_scratch;
+            }
+            if (W.type == 8 && (K_in % 256) == 0 && ((((uintptr_t) W.d) & 3u) == 0u)) {
+                const unsigned nb = (unsigned) ((N_out + 3) / 4);
+                const uint8_t* w8 = (const uint8_t*) W.d;
+                const uint32_t* xu = (const uint32_t*) xq_ptr;
+                if (T == 1) k_mmvq_q8_0_smallT<1, true, false><<<nb, 128, 0, stream>>>(w8, xu, Y, (int) K_in, (int) N_out, 1);
+                else if (T == 4) k_mmvq_q8_0_smallT<4, true, false><<<nb, 128, 0, stream>>>(w8, xu, Y, (int) K_in, (int) N_out, 4);
+                else k_mmvq_q8_0_smallT<8, false, false><<<nb, 128, 0, stream>>>(w8, xu, Y, (int) K_in, (int) N_out, T);
+                return;
+            }
+            K::native_mmvq(W.type, W.d, xq_ptr, Y, (int) K_in, (int) N_out, T, stream);
+            return;
+        }
+        const uint16_t* xf16 = f16_ready;
+        if (!xf16) {
+            const int64_t tot = (int64_t) T * K_in;
+            k_f32_to_f16<<<(unsigned) ((tot + 255) / 256), 256, 0, stream>>>(X, f16_scratch, tot);
+            xf16 = f16_scratch;
+        }
+        gctx.native(xf16, W.type, W.d, Y, T, N_out, K_in);
     }
 
     void project_preq(const float* X, const void* q8_ready, const DenseMat& W, float* Y, int T, int64_t N_out, int64_t K_in,
@@ -1666,21 +2278,22 @@ struct Engine {
         const int N = (int) hp.n_embd;
         const int B = (int) n_blocks.size();
         const int D = B + 1;
-        if (!c_already_normed) {
+        const bool inline_norm = (!c_already_normed && N == 2304 && T >= 1 && D <= 8 && (n_q == 1 || n_q == 3));
+        if (!c_already_normed && !inline_norm) {
             k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(c, nullptr, norm_cur, N, hp.rms_eps);
         }
         NormMixPtrs np{};
         for (int i = 0; i < B; ++i) np.p[i] = n_blocks[(size_t) (B - 1 - i)];
-        np.p[B] = c_already_normed ? c : norm_cur;
+        np.p[B] = (c_already_normed || inline_norm) ? c : norm_cur;
         const float inv_sqrt_n = 1.0f / std::sqrt((float) N);
         if (T >= 1 && (N & 3) == 0 && D <= 8 && (n_q == 1 || n_q == 3)) {
             MixOuts4 mo4{};
             for (int i = 0; i < (swa_bcast ? 3 : n_q); ++i) mo4.p[i] = outs[i];
             if (N == 2304) {
                 if (n_q == 1) {
-                    k_mix_normed_fused_1pass<1><<<(unsigned) T, 576, 0, st>>>(np, D, query, nullptr, mo4, N, inv_sqrt_n, swa_bcast);
+                    k_mix_normed_fused_1pass<1><<<(unsigned) T, 576, 0, st>>>(np, D, query, nullptr, mo4, N, inv_sqrt_n, swa_bcast, inline_norm ? 1 : 0, hp.rms_eps);
                 } else {
-                    k_mix_normed_fused_1pass<3><<<(unsigned) T, 576, 0, st>>>(np, D, query, nullptr, mo4, N, inv_sqrt_n, 0);
+                    k_mix_normed_fused_1pass<3><<<(unsigned) T, 576, 0, st>>>(np, D, query, nullptr, mo4, N, inv_sqrt_n, 0, inline_norm ? 1 : 0, hp.rms_eps);
                 }
             } else if (n_q == 1) {
                 k_mix_normed_fused<1><<<(unsigned) T, kThreads, 0, st>>>(np, D, query, nullptr, mo4, N, inv_sqrt_n, swa_bcast);
@@ -1697,6 +2310,28 @@ struct Engine {
     void run_control(const float* c, const float* msg, const PhysLayer& L, int mod, float* out, int T) {
         const auto& hp = m->hp;
         const int N = (int) hp.n_embd;
+        if (T >= 32 && (N & 3) == 0 && L.loop_down[mod].type == 1 && L.loop_gain[mod].type == 1 && L.loop_forget[mod].type == 1) {
+            const int64_t R = hp.loop_gate_rank;
+            const int64_t n_x64 = (int64_t) T * R;
+            k_control_prep_f16<<<dim3(2, (unsigned) T), kThreads, 0, st>>>(c, msg, act_bf16, N, hp.rms_eps);
+            gemm.f16(act_bf16, (const uint16_t*) L.loop_down[mod].d, ctrl64, T, R, 2 * N);
+            k_f32_to_f16<<<(unsigned) ((n_x64 + 255) / 256), 256, 0, st>>>(ctrl64, act_bf16, n_x64);
+            gemm.f16(act_bf16, (const uint16_t*) L.loop_gain[mod].d, ctrl_g, T, N, R);
+            gemm.f16(act_bf16, (const uint16_t*) L.loop_forget[mod].d, ctrl_f, T, N, R);
+            const int64_t tot = (int64_t) T * N;
+            const int64_t n4 = ((tot & 3) == 0) ? (tot >> 2) : tot;
+            k_control_combine<<<(unsigned) ((n4 + 255) / 256), 256, 0, st>>>(c, msg, ctrl_g, ctrl_f, out, tot);
+            return;
+        }
+        if (T == 1 && L.loop_down[mod].type == 1 && L.loop_gain[mod].type == 1 && L.loop_forget[mod].type == 1 &&
+            hp.loop_gate_rank == 64 && (N & 3) == 0) {
+            k_loop_down_fused_f16_t1<<<64, 256, 0, st>>>(
+                (const uint16_t*) L.loop_down[mod].d, c, msg, ctrl64, N, 64, hp.rms_eps);
+            k_control_up_combine_f16_t1<<<(unsigned) ((N + 31) / 32), 256, 0, st>>>(
+                c, msg, (const uint16_t*) L.loop_gain[mod].d, (const uint16_t*) L.loop_forget[mod].d,
+                ctrl64, out, 64, N);
+            return;
+        }
         if (T >= 32 && (N & 3) == 0 && ctrl_w16 && L.loop_down[mod].type == 0 && L.loop_gain[mod].type == 0 && L.loop_forget[mod].type == 0) {
             // FP16 Tensor Core path for prefill loop controllers (zero extra VRAM: uses ctrl_w16 slice in layer_arena + act_bf16).
             const int64_t R = hp.loop_gate_rank;
@@ -1853,13 +2488,14 @@ struct Engine {
     }
 
     void run_moe(PhysLayer& L, int il, const float* x_norm, int T, bool pre_routed_t1 = false,
-                 bool xq_ready_in = false, bool skip_combine = false, bool f16_ready_in = false) {
+                 bool xq_ready_in = false, bool skip_combine = false, bool f16_ready_in = false,
+                 bool use_p2p_spin = false) {
         const auto& hp = m->hp;
         const int N = (int) hp.n_embd, Kp = (int) hp.n_expert_used;
         const int n_ent = T * Kp;
         const bool has_gpu = L.n_slots > 0;
         const bool has_peer = (L.peer_slots > 0 && peer.dev >= 0);
-        const bool need_cpu = (L.n_slots + L.peer_slots) < hp.n_expert;
+        const bool need_cpu = L.tp_moe ? (L.n_slots < hp.n_expert || L.peer_slots < hp.n_expert) : ((L.n_slots + L.peer_slots) < hp.n_expert);
         const bool is_q5 = (L.L.gu_type == 13);
         const bool fused_rg = (!need_cpu && !has_peer && has_gpu && !pre_routed_t1 && T >= 1 && T <= 8 &&
                                hp.n_expert <= 128 && Kp <= 16);
@@ -1880,9 +2516,14 @@ struct Engine {
                     grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
                     (profile.use_d_hits || hybrid || full_kv_cap < ctx) ? L.d_hits : nullptr);
             } else {
+                const bool route_p2p = (use_p2p_spin && T == 1 && peer.fg_ready && xq_ready_in && N == 2304);
                 k_route_inkling2<<<(unsigned) T, 32, 0, st>>>(
                     router_logits, L.exp_probs_b, ids, ewts, (int) hp.n_expert, Kp, hp.expert_weights_scale,
-                    (profile.use_d_hits || hybrid || full_kv_cap < ctx) ? L.d_hits : nullptr);
+                    (profile.use_d_hits || hybrid || full_kv_cap < ctx) ? L.d_hits : nullptr,
+                    route_p2p ? peer.fg_ids : nullptr,
+                    route_p2p ? peer.fg_ewts : nullptr,
+                    route_p2p ? peer.fg_flag1 : nullptr,
+                    route_p2p ? (uint32_t) (il * 2 + 2) : 0u);
             }
             if (prof_detail) { CK(cudaStreamSynchronize(st)); p_d_route += ms_since(tp_moe_r0); }
         }
@@ -1953,6 +2594,48 @@ struct Engine {
             return;
         }
 
+#if defined(__HIP_PLATFORM_AMD__)
+        if (has_peer && !need_cpu && use_p2p_spin && T == 1 && peer.fg_ready) {
+            const uint32_t step_m = (uint32_t) (il * 2 + 2);
+            const size_t q8_bytes = ((size_t) N / 32) * 36;
+            ensure_q8();
+            if (!(xq_ready_in && !pre_routed_t1 && N == 2304)) {
+                k_p2p_push_moe_t1<<<1, 256, 0, st>>>(
+                    peer.fg_xq_q, xq, peer.fg_ids, ids, peer.fg_ewts, ewts,
+                    (int) q8_bytes, Kp, peer.fg_flag1, step_m);
+            }
+            const int n4 = ((N & 3) == 0) ? (N >> 2) : N;
+            const bool fused_t1 = L.tp_moe && K::native_expert_nvfp4_t1_fused(
+                L.L, L.d_blobs, L.stride, ids, ewts, Kp, xq, escr, moe_raw, st);
+            if (!fused_t1 && has_gpu) {
+                k_group_experts<<<1, 128, 0, st>>>(ids, L.d_slot_of, L.d_blobs, L.stride, n_ent, (int) hp.n_expert, L.n_slots,
+                                                   grp_ptr, grp_start, n_groups, ent_dst, ent_tok, Kp);
+                const int64_t est_gpu = ((int64_t) n_ent * L.n_slots + hp.n_expert - 1) / hp.n_expert;
+                run_grouped(grp_ptr, std::min<int64_t>(n_ent, L.n_slots), est_gpu);
+                k_combine_experts_masked_add<<<dim3((unsigned) ((n4 + 255) / 256), 1), 256, 0, st>>>(
+                    eparts, ewts, ids, L.d_slot_of, nullptr, moe_raw, N, Kp);
+            }
+            CK(cudaSetDevice(peer.dev));
+            k_p2p_wait<<<1, 1, 0, peer.st>>>(peer.fg_flag1, step_m);
+            if (!fused_t1 || !K::native_expert_nvfp4_t1_fused(
+                    L.L, L.peer_blobs, L.stride, peer.fg_ids, peer.fg_ewts, Kp,
+                    peer.fg_xq_q, peer.escr, peer.fg_moe_from_peer, peer.st)) {
+                k_group_experts<<<1, 128, 0, peer.st>>>(peer.fg_ids, L.peer_d_slot_of, L.peer_blobs, L.stride, n_ent,
+                                                        (int) hp.n_expert, L.peer_slots,
+                                                        peer.grp_ptr, peer.grp_start, peer.n_groups, peer.ent_dst, peer.ent_tok, Kp);
+                const int64_t cap_peer = std::min<int64_t>(n_ent, L.peer_slots);
+                K::native_expert_grouped(L.L, peer.grp_ptr, peer.grp_start, peer.n_groups,
+                                         peer.ent_dst, peer.ent_tok, cap_peer, n_ent,
+                                         peer.fg_xq_q, peer.escr, peer.eparts, peer.st);
+                k_combine_experts_masked_add<<<dim3((unsigned) ((n4 + 255) / 256), 1), 256, 0, peer.st>>>(
+                    peer.eparts, peer.fg_ewts, peer.fg_ids, L.peer_d_slot_of, nullptr, peer.fg_moe_from_peer, N, Kp);
+            }
+            k_p2p_signal<<<1, 1, 0, peer.st>>>(peer.fg_flag0, step_m);
+            CK(cudaSetDevice(peer.primary_dev));
+            hy_gpu += n_ent;
+            return;
+        }
+#endif
         if (has_peer && !need_cpu) {
             // Primary + Peer GPU parallel MoE execution (zero CPU fallback!)
             const size_t x_bytes = (size_t) T * (size_t) N * sizeof(float);
@@ -1963,7 +2646,7 @@ struct Engine {
             // Fast path: ship already-quantized Q8_1 (T<16, 72% smaller) or FP16 (T>=16, 50% smaller) directly
             const bool send_q8 = (!try_wmma && (N & 31) == 0);
             const bool send_f16 = (try_wmma && f16_ready_in && L.L.had_block == 0 && !L.L.gu_nib &&
-                                   (L.L.n_embd % 256 == 0) && (L.L.n_ff % 128 == 0));
+                                   (L.L.n_embd % 256 == 0) && (L.L.n_ff % 64 == 0));
             if (send_q8) ensure_q8();
             if (!peer.p2p) {
                 if (send_q8) CK(cudaMemcpyAsync(peer.h_x, xq, q8_bytes, cudaMemcpyDeviceToHost, st));
@@ -2681,6 +3364,41 @@ struct Engine {
         CK(cudaMemcpyAsync(ffn_inp, h_tok_buf, (size_t) T * N * sizeof(float), cudaMemcpyHostToDevice, st));
         const int32_t pos32 = (int32_t) pos;
         CK(cudaMemcpyAsync(pos0_d, &pos32, sizeof(int32_t), cudaMemcpyHostToDevice, st));
+        if (peer.tp_attn && peer.pos0_d) {
+            CK(cudaSetDevice(peer.dev));
+            CK(cudaMemcpyAsync(peer.pos0_d, &pos32, sizeof(int32_t), cudaMemcpyHostToDevice, peer.st));
+            CK(cudaSetDevice(peer.primary_dev));
+        }
+        const bool compute_logits_early = need_logits || copy_logits || all_row_logits || out_picks != nullptr;
+#if defined(__HIP_PLATFORM_AMD__)
+        const bool use_p2p_spin = (T == 1 && peer.fg_ready && peer.tp_attn && m->tp_moe && m->vocab_tp1 > 0 &&
+                                   compute_logits_early && !copy_logits && !all_row_logits && !out_picks &&
+                                   !capture_dspark && !prof_detail);
+        const bool use_tp_graph = use_p2p_spin && !(ev_prof_en && ev_prof_step == 32) &&
+                                  (std::getenv("STRATA_NO_TP_GRAPH") == nullptr);
+        if (use_tp_graph && peer.tp_graph0 && peer.tp_graph1) {
+            CK(cudaSetDevice(peer.dev));
+            CK(cudaGraphLaunch(peer.tp_graph1, peer.st));
+            CK(cudaSetDevice(peer.primary_dev));
+            CK(cudaGraphLaunch(peer.tp_graph0, st));
+            int32_t next_tok = 0;
+            CK(cudaMemcpyAsync(&next_tok, pick_d, sizeof(int32_t), cudaMemcpyDeviceToHost, st));
+            CK(cudaStreamSynchronize(st));
+            pos += 1;
+            return next_tok;
+        }
+        bool capturing_tp_graph = false;
+        if (use_tp_graph && !peer.tp_graph0) {
+            CK(cudaSetDevice(peer.dev));
+            CK(cudaStreamBeginCapture(peer.st, cudaStreamCaptureModeThreadLocal));
+            CK(cudaSetDevice(peer.primary_dev));
+            CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
+            capturing_tp_graph = true;
+        }
+#else
+        const bool use_p2p_spin = false;
+        const bool capturing_tp_graph = false;
+#endif
         k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(ffn_inp, m->tok_embd_norm, cur, N, hp.rms_eps);
         if (prof) { CK(cudaStreamSynchronize(st)); p_embd_ms += ms_since(tp_e0); }
 
@@ -2699,6 +3417,8 @@ struct Engine {
         float* bank_last_norm = norm_blk_buf[8];     // cached normalized bank_last
 
         auto run_layer_pre = [&](int il, bool include_route_t1 = false) {
+            const bool evp = (T == 1 && ev_prof_en && ev_prof_step == 32 && il < 64);
+            if (evp) { ev_ensure(); cudaEventRecord(ev_t[il][0], st); }
             const int ip = hp.loop_layer(il);
             PhysLayer& L = m->layers[(size_t) ip];
             const bool is_swa = hp.is_swa(il);
@@ -2756,6 +3476,7 @@ struct Engine {
             const bool fuse_q8_norm = (T <= 8 && (N & 31) == 0);
             const int rms_q8_blk = (N == 2304) ? 768 : kThreads;
             bool q8_pre_done = false;
+            bool swa_p2p_pushed = false;
             if (L.attn_res_query) {
                 float* outs[3] = {in_q, in_k, in_v};
                 run_mix_normed(norm_blocks, cur, false, L.attn_res_query, outs, is_swa ? 1 : 3, T, is_swa ? 1 : 0);
@@ -2779,8 +3500,15 @@ struct Engine {
                     }
                 } else if (is_swa) {
                     if (fuse_q8_norm) {
-                        k_rms_norm_q8_1<<<(unsigned) T, rms_q8_blk, 0, st>>>(in_q, L.attn_norm, in_q, xq, N, hp.rms_eps);
+                        const bool push_p2p = (use_p2p_spin && N == 2304);
+                        k_rms_norm_q8_1<<<(unsigned) T, rms_q8_blk, 0, st>>>(
+                            in_q, L.attn_norm, in_q, xq, N, hp.rms_eps,
+                            push_p2p ? peer.fg_in_q : nullptr,
+                            push_p2p ? peer.fg_xq_q : nullptr,
+                            push_p2p ? peer.fg_flag1 : nullptr,
+                            push_p2p ? (uint32_t) (il * 2 + 1) : 0u);
                         q8_pre_done = true;
+                        swa_p2p_pushed = push_p2p;
                     } else if (T > 8) {
                         k_rms_norm_f16<<<(unsigned) T, kThreads, 0, st>>>(in_q, L.attn_norm, in_q, act_bf16, N, hp.rms_eps);
                     } else {
@@ -2792,7 +3520,19 @@ struct Engine {
                     if (fuse_q8_norm) {
                         k_rms_norm_3_q8_1<<<dim3(3, (unsigned) T), rms_q8_blk, 0, st>>>(
                             in_q, in_k, in_v, in_q, in_k, in_v, L.attn_q_inp_norm, L.attn_k_inp_norm, L.attn_v_inp_norm,
-                            xq, xq_k, xq_v, N, hp.rms_eps);
+                            xq, xq_k, xq_v, N, hp.rms_eps,
+                            (use_p2p_spin && N == 2304) ? peer.fg_in_q : nullptr,
+                            (use_p2p_spin && N == 2304) ? peer.fg_in_k : nullptr,
+                            (use_p2p_spin && N == 2304) ? peer.fg_in_v : nullptr,
+                            (use_p2p_spin && N == 2304) ? peer.fg_xq_q : nullptr,
+                            (use_p2p_spin && N == 2304) ? peer.fg_xq_k : nullptr,
+                            (use_p2p_spin && N == 2304) ? peer.fg_xq_v : nullptr);
+                        if (use_p2p_spin && N == 2304) {
+#if defined(__HIP_PLATFORM_AMD__)
+                            k_p2p_signal<<<1, 1, 0, st>>>(peer.fg_flag1, (uint32_t) (il * 2 + 1));
+                            swa_p2p_pushed = true;
+#endif
+                        }
                         q8_pre_done = true;
                     } else if (T > 8) {
                         k_rms_norm_3_f16<<<dim3(3, (unsigned) T), kThreads, 0, st>>>(
@@ -2806,14 +3546,39 @@ struct Engine {
                 }
             } else {
                 if (has_msg) {
-                    run_control(cur, msg0, L, 0, in_q, T);
-                    run_control(cur, msg1, L, 1, in_k, T);
-                    run_control(cur, msg2, L, 2, in_v, T);
+                    if (T == 1 && hp.loop_gate_rank == 64 && (N & 3) == 0 &&
+                        L.loop_down[0].type == 1 && L.loop_down[1].type == 1 && L.loop_down[2].type == 1 &&
+                        L.loop_gain[0].type == 1 && L.loop_gain[1].type == 1 && L.loop_gain[2].type == 1) {
+                        k_loop_down_fused_f16_3way_t1<<<dim3(64, 3), 256, 0, st>>>(
+                            (const uint16_t*) L.loop_down[0].d, (const uint16_t*) L.loop_down[1].d, (const uint16_t*) L.loop_down[2].d,
+                            cur, msg0, msg1, msg2, ctrl64, N, 64, hp.rms_eps);
+                        k_control_up_combine_f16_3way_t1<<<dim3((unsigned) ((N + 31) / 32), 3), 256, 0, st>>>(
+                            cur, msg0, msg1, msg2,
+                            (const uint16_t*) L.loop_gain[0].d, (const uint16_t*) L.loop_gain[1].d, (const uint16_t*) L.loop_gain[2].d,
+                            (const uint16_t*) L.loop_forget[0].d, (const uint16_t*) L.loop_forget[1].d, (const uint16_t*) L.loop_forget[2].d,
+                            ctrl64, in_q, in_k, in_v, 64, N);
+                    } else {
+                        run_control(cur, msg0, L, 0, in_q, T);
+                        run_control(cur, msg1, L, 1, in_k, T);
+                        run_control(cur, msg2, L, 2, in_v, T);
+                    }
                     if (is_swa) {
                         if (fuse_q8_norm) {
                             k_rms_norm_3_q8_1<<<dim3(3, (unsigned) T), rms_q8_blk, 0, st>>>(
                                 in_q, in_k, in_v, in_q, in_k, in_v, L.attn_norm, L.attn_norm, L.attn_norm,
-                                xq, xq_k, xq_v, N, hp.rms_eps);
+                                xq, xq_k, xq_v, N, hp.rms_eps,
+                            (use_p2p_spin && N == 2304) ? peer.fg_in_q : nullptr,
+                            (use_p2p_spin && N == 2304) ? peer.fg_in_k : nullptr,
+                            (use_p2p_spin && N == 2304) ? peer.fg_in_v : nullptr,
+                            (use_p2p_spin && N == 2304) ? peer.fg_xq_q : nullptr,
+                            (use_p2p_spin && N == 2304) ? peer.fg_xq_k : nullptr,
+                            (use_p2p_spin && N == 2304) ? peer.fg_xq_v : nullptr);
+                        if (use_p2p_spin && N == 2304) {
+#if defined(__HIP_PLATFORM_AMD__)
+                            k_p2p_signal<<<1, 1, 0, st>>>(peer.fg_flag1, (uint32_t) (il * 2 + 1));
+                            swa_p2p_pushed = true;
+#endif
+                        }
                             q8_pre_done = true;
                         } else if (T > 8) {
                             k_rms_norm_3_f16<<<dim3(3, (unsigned) T), kThreads, 0, st>>>(
@@ -2826,7 +3591,19 @@ struct Engine {
                         if (fuse_q8_norm) {
                             k_rms_norm_3_q8_1<<<dim3(3, (unsigned) T), rms_q8_blk, 0, st>>>(
                                 in_q, in_k, in_v, in_q, in_k, in_v, L.attn_q_inp_norm, L.attn_k_inp_norm, L.attn_v_inp_norm,
-                                xq, xq_k, xq_v, N, hp.rms_eps);
+                                xq, xq_k, xq_v, N, hp.rms_eps,
+                            (use_p2p_spin && N == 2304) ? peer.fg_in_q : nullptr,
+                            (use_p2p_spin && N == 2304) ? peer.fg_in_k : nullptr,
+                            (use_p2p_spin && N == 2304) ? peer.fg_in_v : nullptr,
+                            (use_p2p_spin && N == 2304) ? peer.fg_xq_q : nullptr,
+                            (use_p2p_spin && N == 2304) ? peer.fg_xq_k : nullptr,
+                            (use_p2p_spin && N == 2304) ? peer.fg_xq_v : nullptr);
+                        if (use_p2p_spin && N == 2304) {
+#if defined(__HIP_PLATFORM_AMD__)
+                            k_p2p_signal<<<1, 1, 0, st>>>(peer.fg_flag1, (uint32_t) (il * 2 + 1));
+                            swa_p2p_pushed = true;
+#endif
+                        }
                             q8_pre_done = true;
                         } else if (T > 8) {
                             k_rms_norm_3_f16<<<dim3(3, (unsigned) T), kThreads, 0, st>>>(
@@ -2840,8 +3617,15 @@ struct Engine {
                     }
                 } else if (is_swa) {
                     if (fuse_q8_norm) {
-                        k_rms_norm_q8_1<<<(unsigned) T, rms_q8_blk, 0, st>>>(cur, L.attn_norm, in_q, xq, N, hp.rms_eps);
+                        const bool push_swa_p2p = (use_p2p_spin && N == 2304);
+                        k_rms_norm_q8_1<<<(unsigned) T, rms_q8_blk, 0, st>>>(
+                            cur, L.attn_norm, in_q, xq, N, hp.rms_eps,
+                            push_swa_p2p ? peer.fg_in_q : nullptr,
+                            push_swa_p2p ? peer.fg_xq_q : nullptr,
+                            push_swa_p2p ? peer.fg_flag1 : nullptr,
+                            push_swa_p2p ? (uint32_t) (il * 2 + 1) : 0u);
                         q8_pre_done = true;
+                        swa_p2p_pushed = push_swa_p2p;
                     } else if (T > 8) {
                         k_rms_norm_f16<<<(unsigned) T, kThreads, 0, st>>>(cur, L.attn_norm, in_q, act_bf16, N, hp.rms_eps);
                     } else {
@@ -2853,7 +3637,19 @@ struct Engine {
                     if (fuse_q8_norm) {
                         k_rms_norm_3_q8_1<<<dim3(3, (unsigned) T), rms_q8_blk, 0, st>>>(
                             cur, cur, cur, in_q, in_k, in_v, L.attn_q_inp_norm, L.attn_k_inp_norm, L.attn_v_inp_norm,
-                            xq, xq_k, xq_v, N, hp.rms_eps);
+                            xq, xq_k, xq_v, N, hp.rms_eps,
+                            (use_p2p_spin && N == 2304) ? peer.fg_in_q : nullptr,
+                            (use_p2p_spin && N == 2304) ? peer.fg_in_k : nullptr,
+                            (use_p2p_spin && N == 2304) ? peer.fg_in_v : nullptr,
+                            (use_p2p_spin && N == 2304) ? peer.fg_xq_q : nullptr,
+                            (use_p2p_spin && N == 2304) ? peer.fg_xq_k : nullptr,
+                            (use_p2p_spin && N == 2304) ? peer.fg_xq_v : nullptr);
+                        if (use_p2p_spin && N == 2304) {
+#if defined(__HIP_PLATFORM_AMD__)
+                            k_p2p_signal<<<1, 1, 0, st>>>(peer.fg_flag1, (uint32_t) (il * 2 + 1));
+                            swa_p2p_pushed = true;
+#endif
+                        }
                         q8_pre_done = true;
                     } else if (T > 8) {
                         k_rms_norm_3_f16<<<dim3(3, (unsigned) T), kThreads, 0, st>>>(
@@ -2867,7 +3663,277 @@ struct Engine {
                 }
             }
             if (prof_detail) { CK(cudaStreamSynchronize(st)); p_d_mix += ms_since(tp_d0); }
+            if (evp) cudaEventRecord(ev_t[il][1], st);
 
+            float* hst = conv_hist[(size_t) il];
+            float* h_tr = save_conv_trace ? (d_conv_trace + (size_t) il * layer_conv_floats) : nullptr;
+            const auto tp_d3_outer = Clock::now();
+            if (peer.tp_attn && kv_q8) {
+                const auto tp_d1 = Clock::now();
+                const int64_t nh2 = hp.n_head / 2;
+                const int64_t nkv2 = hp.n_head_kv / 2;
+                const int64_t q2 = nh2 * hp.head_dim;
+                const int64_t kv2 = nkv2 * hp.head_dim;
+                const int64_t rel2 = nh2 * hp.n_rel;
+                const int64_t dyn2 = nkv2 * hp.n_conv;
+
+                const void* xq_k_src = (ink_src == in_q) ? xq : xq_k;
+                const void* xq_v_src = (inv_src == in_q) ? xq : (inv_src == ink_src ? xq_k_src : xq_v);
+                if (!q8_pre_done && T <= 8) {
+                    prep_q8(in_q, xq, T, N);
+                    if (ink_src != in_q) prep_q8(ink_src, xq_k, T, N);
+                    if (inv_src != in_q && inv_src != ink_src) prep_q8(inv_src, xq_v, T, N);
+                }
+                const uint16_t* f16_q = (T > 8) ? act_bf16 : nullptr;
+                const uint16_t* f16_k_pre = (T > 8) ? ((ink_src == in_q) ? act_bf16 : (act_bf16 + (size_t) T * N)) : nullptr;
+                const bool k_diff = (ink_src != in_q);
+                const bool v_diff = (inv_src != in_q && inv_src != ink_src);
+                const bool v_eq_k = (inv_src == ink_src);
+
+                // Signal peer GPU that inputs are ready
+                if (!use_p2p_spin) {
+                    CK(cudaEventRecord(peer.ev_attn_go, st));
+                }
+
+                auto run_half = [&](cudaStream_t rst, strata::prefill::Gemm& rgemm,
+                                    const DenseMat& w_q, const DenseMat& w_g, const DenseMat& w_r,
+                                    const DenseMat& w_k, const DenseMat& w_v,
+                                    const DenseMat& w_qgr, const DenseMat& w_qgrkv,
+                                    const DenseMat& w_kc, const DenseMat& w_vc,
+                                    const DenseMat& w_sink, const DenseMat& w_out,
+                                    const float* w_qclip, const float* w_rclip, const float* w_rbias,
+                                    const float* w_kconv, const float* w_vconv,
+                                    const float* r_inq, const float* r_ink, const float* r_inv,
+                                    const void* r_xqq, const void* r_xqk, const void* r_xqv,
+                                    const uint16_t* r_f16q, const uint16_t* r_f16k, uint16_t* r_f16_scr,
+                                    float* rQ, float* rGate, float* rR, float* rK, float* rV,
+                                    float* rSink, float* rDynK, float* rDynV, float* rQgrT1,
+                                    float* rKconv, float* rVconv, float* rRelTab, float* rAtt,
+                                    void* rAttXq, float* rSplit, float* rWo,
+                                    int8_t* r_kq, __half* r_ks, int8_t* r_vq, __half* r_vs,
+                                    float* r_hst, const int32_t* r_pos0, bool is_primary) {
+                    project_preq_on(rst, rgemm, rAttXq, r_f16_scr, r_inq, r_xqq, w_sink, rSink, T, nh2, N, r_f16q);
+                    float* pQ = rQ; float* pGate = rGate; float* pR = rR;
+                    float* pK = rK; float* pV = rV; float* pDynK = rDynK; float* pDynV = rDynV;
+                    if (T == 1 && !has_msg && is_swa && w_qgrkv.d != nullptr) {
+                        pQ = rQgrT1; pGate = rQgrT1 + q2; pR = rQgrT1 + 2 * q2;
+                        pK = pR + rel2; pV = pK + kv2;
+                        project_preq_on(rst, rgemm, rAttXq, r_f16_scr, r_inq, r_xqq, w_qgrkv, rQgrT1, 1, w_qgrkv.n_out, N);
+                    } else {
+                        if (T == 1 && w_qgr.d != nullptr) {
+                            pQ = rQgrT1; pGate = rQgrT1 + q2; pR = rQgrT1 + 2 * q2;
+                            project_preq_on(rst, rgemm, rAttXq, r_f16_scr, r_inq, r_xqq, w_qgr, rQgrT1, 1, w_qgr.n_out, N);
+                        } else {
+                            project_preq_on(rst, rgemm, rAttXq, r_f16_scr, r_inq, r_xqq, w_q, rQ, T, q2, N, r_f16q);
+                            project_preq_on(rst, rgemm, rAttXq, r_f16_scr, r_inq, r_xqq, w_g, rGate, T, q2, N, r_f16q);
+                            project_preq_on(rst, rgemm, rAttXq, r_f16_scr, r_inq, r_xqq, w_r, rR, T, rel2, N, r_f16q);
+                        }
+                        project_preq_on(rst, rgemm, rAttXq, r_f16_scr, r_ink, r_xqk, w_k, rK, T, kv2, N, r_f16k);
+                        project_preq_on(rst, rgemm, rAttXq, r_f16_scr, r_inv, r_xqv, w_v, rV, T, kv2, N, (T > 8 && r_inv == r_inq) ? r_f16q : nullptr);
+                        if (!is_swa) {
+                            project_preq_on(rst, rgemm, rAttXq, r_f16_scr, r_ink, r_xqk, w_kc, rDynK, T, dyn2, N, bf16_x_f16 ? r_f16k : nullptr);
+                            project_preq_on(rst, rgemm, rAttXq, r_f16_scr, r_inv, r_xqv, w_vc, rDynV, T, dyn2, N, nullptr);
+                        }
+                    }
+                    if (is_primary && evp) cudaEventRecord(ev_t[il][2], rst);
+
+                    const int apply_tau = is_swa ? 0 : 1;
+                    const int max_rel = is_swa ? std::min<int>((int) hp.n_rel_ext, (int) hp.n_swa) : (int) hp.n_rel_ext;
+                    if (T == 1 && hp.head_dim == 128 && hp.n_rel == 16) {
+                        k_qkv_prep_rel_t1<<<(unsigned) (2 * nkv2 + nh2), 128, 0, rst>>>(
+                            pQ, w_qclip, hp.qk_clip, pR, w_rclip, hp.rel_clip, w_rbias, rSink, rRelTab,
+                            pK, pV, w_kconv, w_vconv, is_swa ? nullptr : pDynK, is_swa ? nullptr : pDynV,
+                            r_hst, r_kq, r_ks, r_vq, r_vs,
+                            (int) nh2, (int) nkv2, (int) hp.n_rel, (int) hp.n_rel_ext, max_rel,
+                            apply_tau, (int) hp.log_scale_floor, hp.log_scale_alpha, hp.rms_eps,
+                            r_pos0, kv_cap[(size_t) il], is_swa ? 1 : 0);
+                    } else {
+                    const bool fused_kv_q8 = (T < 32 && hp.head_dim == 128);
+                    if (fused_kv_q8) {
+                        k_shortconv_kv_clip_norm_store_q8<<<dim3((unsigned) nkv2, 2), 128, 0, rst>>>(
+                            pK, pV, w_kconv, w_vconv, is_swa ? nullptr : pDynK, is_swa ? nullptr : pDynV,
+                            r_hst, r_kq, r_ks, r_vq, r_vs,
+                            (int) nkv2, hp.qk_clip, hp.rms_eps, r_pos0, kv_cap[(size_t) il], is_swa ? 1 : 0, T, nullptr, 0);
+                    } else if (T >= 32) {
+                        k_shortconv_kv_pp<<<dim3((unsigned) ((2 * kv2 + 255) / 256), (unsigned) ((T + 15) / 16)), 256, 0, rst>>>(
+                            pK, pV, w_kconv, w_vconv, is_swa ? nullptr : pDynK, is_swa ? nullptr : pDynV,
+                            r_hst, rKconv, rVconv, (int) kv2, (int) nkv2, T);
+                        k_shortconv_kv_hist_push<<<(unsigned) ((2 * kv2 + 255) / 256), 256, 0, rst>>>(
+                            pK, pV, r_hst, (int) kv2, T);
+                    } else {
+                        k_shortconv_kv<<<(unsigned) ((2 * kv2 + 255) / 256), 256, 0, rst>>>(
+                            pK, pV, w_kconv, w_vconv, is_swa ? nullptr : pDynK, is_swa ? nullptr : pDynV,
+                            r_hst, rKconv, rVconv, (int) kv2, (int) nkv2, T, nullptr, 0);
+                    }
+                    if (hp.head_dim == 128 && hp.n_rel <= 32) {
+                        k_clip_and_tau_qr<<<dim3((unsigned) nh2, (unsigned) T), 32, 0, rst>>>(
+                            pQ, w_qclip, hp.qk_clip, pR, w_rclip, hp.rel_clip,
+                            (int) nh2, (int) hp.n_rel, apply_tau, r_pos0, (int) hp.log_scale_floor, hp.log_scale_alpha);
+                    } else {
+                        k_clip_and_tau<<<dim3((unsigned) nh2, (unsigned) T), 32, 0, rst>>>(
+                            pQ, w_qclip, hp.qk_clip, (int) hp.head_dim, (int) nh2, apply_tau, r_pos0, (int) hp.log_scale_floor, hp.log_scale_alpha);
+                        k_clip_and_tau<<<dim3((unsigned) nh2, (unsigned) T), 32, 0, rst>>>(
+                            pR, w_rclip, hp.rel_clip, (int) hp.n_rel, (int) nh2, apply_tau, r_pos0, (int) hp.log_scale_floor, hp.log_scale_alpha);
+                    }
+                    if (!fused_kv_q8) {
+                        k_clip_norm_kv_store_q8<<<dim3((unsigned) nkv2, (unsigned) T), 32, 0, rst>>>(
+                            rKconv, rVconv, r_kq, r_ks, r_vq, r_vs,
+                            (int) nkv2, hp.qk_clip, hp.rms_eps, r_pos0, kv_cap[(size_t) il], is_swa ? 1 : 0);
+                    }
+                    if (T == 1 && hp.n_rel == 16) {
+                        const int d_splits = (max_rel > 512) ? 4 : 2;
+                        k_rel_table_split<<<dim3((unsigned) nh2, (unsigned) d_splits), 128, 0, rst>>>(
+                            pR, w_rbias, rSink, rRelTab, (int) nh2, (int) hp.n_rel, (int) hp.n_rel_ext, max_rel, r_pos0, T, d_splits);
+                    } else {
+                        k_rel_table<<<dim3((unsigned) nh2, (unsigned) ((T + 7) / 8)), kThreads, 0, rst>>>(
+                            pR, w_rbias, rSink, rRelTab, (int) nh2, (int) hp.n_rel, (int) hp.n_rel_ext, max_rel, r_pos0, T);
+                    }
+                    }
+                    const float kq_scale = 1.0f / std::sqrt((float) hp.head_dim);
+                    const void* att_xq_r = nullptr;
+                    const int sp_cap = std::max(1, attn_split_slots / std::max(1, T));
+                    if (T < 16) {
+                        const int sp = std::min(sp_cap, (T == 1)
+                            ? (is_swa ? std::max(attn_split_t1_swa, 16) : attn_split_t1_full)
+                            : (is_swa ? 8 : 32));
+                        k_attn_q8_gqa3_split<<<dim3((unsigned) nkv2, (unsigned) sp, (unsigned) T), 128, 0, rst>>>(
+                            pQ, r_kq, r_ks, r_vq, r_vs, rRelTab, rSink, rSplit,
+                            (int) nh2, (int) nkv2, (int) hp.n_rel_ext, kv_cap[(size_t) il], is_swa ? 1 : 0, (int) hp.n_swa, r_pos0, kq_scale, sp);
+                        k_attn_split_combine<<<dim3((unsigned) nh2, (unsigned) T), 128, 0, rst>>>(
+                            rSplit, pGate, rAtt, (int) nh2, sp, r_pos0, is_swa ? 1 : 0, (int) hp.n_swa, (T <= 8) ? rAttXq : nullptr);
+                        if (T <= 8) att_xq_r = rAttXq;
+                    } else {
+                        k_attn_q8_gqa3_pp_wmma<<<dim3((unsigned) nh2, (unsigned) ((T + 15) / 16)), 128, 29184, rst>>>(
+                            pQ, r_kq, r_ks, r_vq, r_vs, rRelTab, rSink, pGate, rAtt,
+                            (int) nh2, (int) nkv2, (int) hp.n_rel_ext, kv_cap[(size_t) il], is_swa ? 1 : 0, (int) hp.n_swa, r_pos0, kq_scale, T);
+                    }
+                    if (is_primary && evp) cudaEventRecord(ev_t[il][3], rst);
+                    project_preq_on(rst, rgemm, rAttXq, r_f16_scr, rAtt, att_xq_r, w_out, rWo, T, N, q2);
+                };
+
+                const size_t x_b = (size_t) T * (size_t) N * sizeof(float);
+                const size_t q8_b = (size_t) T * ((size_t) N / 32) * 36;
+                const size_t f16_b = (size_t) T * (size_t) N * sizeof(uint16_t);
+                const auto& PA = L.peer_attn;
+#if defined(__HIP_PLATFORM_AMD__)
+                if (use_p2p_spin) {
+                    const uint32_t step_a = (uint32_t) (il * 2 + 1);
+                    // GPU0 pushes inputs directly to GPU1 FineGrained local buffers & sets flag1
+                    // (Already pushed inline by k_rms_norm_q8_1 when !has_msg && is_swa && q8_pre_done && N == 2304!)
+                    if (!swa_p2p_pushed) {
+                        k_p2p_push_attn_t1<<<1, 256, 0, st>>>(
+                            peer.fg_in_q, in_q, peer.fg_xq_q, xq,
+                            peer.fg_in_k, ink_src, peer.fg_xq_k, xq_k_src,
+                            peer.fg_in_v, inv_src, peer.fg_xq_v, xq_v_src,
+                            (int) N, (int) q8_b, k_diff ? 1 : 0, v_diff ? 1 : 0,
+                            peer.fg_flag1, step_a);
+                    }
+                    // GPU0 runs its own half immediately
+                    run_half(st, gemm,
+                             L.attn_q, L.attn_gate, L.attn_rel, L.attn_k, L.attn_v,
+                             L.attn_qgr, L.attn_qgrkv, L.attn_k_conv_proj, L.attn_v_conv_proj,
+                             L.attn_sink_proj, L.attn_output,
+                             L.attn_q_clip, L.attn_rel_clip, L.attn_rel_bias, L.attn_k_conv, L.attn_v_conv,
+                             in_q, ink_src, inv_src, xq, xq_k_src, xq_v_src, f16_q, f16_k_pre, (uint16_t*) escr,
+                             Q, att_gate, R, K, V, sink, dyn_k, dyn_v, qgr_t1, K_conv, V_conv, rel_tab, att,
+                             xq, attn_split, wo,
+                             kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il],
+                             conv_hist[(size_t) il], pos0_d, true);
+
+                    // GPU1 spins on local flag1, runs its half, pushes wo to GPU0 FineGrained buf & sets flag0
+                    CK(cudaSetDevice(peer.dev));
+                    k_p2p_wait<<<1, 1, 0, peer.st>>>(peer.fg_flag1, step_a);
+                    const float* p_inq_fg = peer.fg_in_q;
+                    const float* p_ink_fg = k_diff ? peer.fg_in_k : peer.fg_in_q;
+                    const float* p_inv_fg = v_diff ? peer.fg_in_v : (v_eq_k ? p_ink_fg : peer.fg_in_q);
+                    const void* p_xqq_fg = peer.fg_xq_q;
+                    const void* p_xqk_fg = k_diff ? peer.fg_xq_k : peer.fg_xq_q;
+                    const void* p_xqv_fg = v_diff ? peer.fg_xq_v : (v_eq_k ? p_xqk_fg : peer.fg_xq_q);
+                    run_half(peer.st, peer.gemm,
+                             PA.attn_q, PA.attn_gate, PA.attn_rel, PA.attn_k, PA.attn_v,
+                             PA.attn_qgr, PA.attn_qgrkv, PA.attn_k_conv_proj, PA.attn_v_conv_proj,
+                             PA.attn_sink_proj, PA.attn_output,
+                             PA.attn_q_clip, PA.attn_rel_clip, PA.attn_rel_bias, PA.attn_k_conv, PA.attn_v_conv,
+                             p_inq_fg, p_ink_fg, p_inv_fg, p_xqq_fg, p_xqk_fg, p_xqv_fg, nullptr, nullptr, (uint16_t*) peer.escr,
+                             peer.Q, peer.att_gate, peer.R, peer.K, peer.V, peer.sink, peer.dyn_k, peer.dyn_v, peer.qgr_t1,
+                             peer.K_conv, peer.V_conv, peer.rel_tab, peer.att,
+                             peer.att_xq, peer.attn_split, peer.fg_wo_from_peer,
+                             peer.kq[(size_t) il], peer.ks[(size_t) il], peer.vq[(size_t) il], peer.vs[(size_t) il],
+                             peer.conv_hist[(size_t) il], peer.pos0_d, false);
+                    k_p2p_signal<<<1, 1, 0, peer.st>>>(peer.fg_flag0, step_a);
+                    CK(cudaSetDevice(peer.primary_dev));
+                } else
+#endif
+                {
+                // Launch GPU1 half FIRST so P2P copy & kernel launch overlap with GPU0 compute!
+                CK(cudaSetDevice(peer.dev));
+                CK(cudaStreamWaitEvent(peer.st, peer.ev_attn_go, 0));
+                const float* p_inq = peer.in_q;
+                const float* p_ink = k_diff ? peer.in_k : peer.in_q;
+                const float* p_inv = v_diff ? peer.in_v : (v_eq_k ? p_ink : peer.in_q);
+                const void* p_xqq = peer.xq;
+                const void* p_xqk = k_diff ? peer.xq_k : peer.xq;
+                const void* p_xqv = v_diff ? peer.xq_v : (v_eq_k ? p_xqk : peer.xq);
+                const uint16_t* p_f16q = (T > 8) ? peer.act_f16 : nullptr;
+                const uint16_t* p_f16k = (T > 8) ? (k_diff ? peer.act_f16_k : peer.act_f16) : nullptr;
+                CK(cudaMemcpyPeerAsync(peer.in_q, peer.dev, in_q, peer.primary_dev, x_b, peer.st));
+                if (T <= 8) {
+                    CK(cudaMemcpyPeerAsync(peer.xq, peer.dev, xq, peer.primary_dev, q8_b, peer.st));
+                    if (k_diff) {
+                        CK(cudaMemcpyPeerAsync(peer.in_k, peer.dev, ink_src, peer.primary_dev, x_b, peer.st));
+                        CK(cudaMemcpyPeerAsync(peer.xq_k, peer.dev, xq_k_src, peer.primary_dev, q8_b, peer.st));
+                    }
+                    if (v_diff) {
+                        CK(cudaMemcpyPeerAsync(peer.in_v, peer.dev, inv_src, peer.primary_dev, x_b, peer.st));
+                        CK(cudaMemcpyPeerAsync(peer.xq_v, peer.dev, xq_v_src, peer.primary_dev, q8_b, peer.st));
+                    }
+                } else {
+                    CK(cudaMemcpyPeerAsync(peer.act_f16, peer.dev, act_bf16, peer.primary_dev, f16_b, peer.st));
+                    if (k_diff) {
+                        CK(cudaMemcpyPeerAsync(peer.in_k, peer.dev, ink_src, peer.primary_dev, x_b, peer.st));
+                        CK(cudaMemcpyPeerAsync(peer.act_f16_k, peer.dev, f16_k_pre, peer.primary_dev, f16_b, peer.st));
+                    }
+                    if (v_diff) {
+                        CK(cudaMemcpyPeerAsync(peer.in_v, peer.dev, inv_src, peer.primary_dev, x_b, peer.st));
+                    }
+                }
+                run_half(peer.st, peer.gemm,
+                         PA.attn_q, PA.attn_gate, PA.attn_rel, PA.attn_k, PA.attn_v,
+                         PA.attn_qgr, PA.attn_qgrkv, PA.attn_k_conv_proj, PA.attn_v_conv_proj,
+                         PA.attn_sink_proj, PA.attn_output,
+                         PA.attn_q_clip, PA.attn_rel_clip, PA.attn_rel_bias, PA.attn_k_conv, PA.attn_v_conv,
+                         p_inq, p_ink, p_inv, p_xqq, p_xqk, p_xqv, p_f16q, p_f16k, (uint16_t*) peer.escr,
+                         peer.Q, peer.att_gate, peer.R, peer.K, peer.V, peer.sink, peer.dyn_k, peer.dyn_v, peer.qgr_t1,
+                         peer.K_conv, peer.V_conv, peer.rel_tab, peer.att,
+                         peer.att_xq, peer.attn_split, peer.wo,
+                         peer.kq[(size_t) il], peer.ks[(size_t) il], peer.vq[(size_t) il], peer.vs[(size_t) il],
+                         peer.conv_hist[(size_t) il], peer.pos0_d, false);
+                if (!peer.p2p) {
+                    CK(cudaMemcpyPeerAsync(peer.d_wo_peer, peer.primary_dev, peer.wo, peer.dev, x_b, peer.st));
+                }
+                CK(cudaEventRecord(peer.ev_attn_done, peer.st));
+
+                // Launch GPU0 half while GPU1 runs concurrently
+                CK(cudaSetDevice(peer.primary_dev));
+                run_half(st, gemm,
+                         L.attn_q, L.attn_gate, L.attn_rel, L.attn_k, L.attn_v,
+                         L.attn_qgr, L.attn_qgrkv, L.attn_k_conv_proj, L.attn_v_conv_proj,
+                         L.attn_sink_proj, L.attn_output,
+                         L.attn_q_clip, L.attn_rel_clip, L.attn_rel_bias, L.attn_k_conv, L.attn_v_conv,
+                         in_q, ink_src, inv_src, xq, xq_k_src, xq_v_src, f16_q, f16_k_pre, (uint16_t*) escr,
+                         Q, att_gate, R, K, V, sink, dyn_k, dyn_v, qgr_t1, K_conv, V_conv, rel_tab, att,
+                         xq, attn_split, wo,
+                         kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il],
+                         conv_hist[(size_t) il], pos0_d, true);
+                CK(cudaStreamWaitEvent(st, peer.ev_attn_done, 0));
+                const int64_t tot_wo = (int64_t) T * N;
+                const int64_t n4_wo = (tot_wo + 3) >> 2;
+                k_vec_add_f32<<<(unsigned) ((n4_wo + 255) / 256), 256, 0, st>>>(
+                    wo, peer.p2p ? peer.wo : peer.d_wo_peer, wo, tot_wo);
+                }
+                const auto tp_d3 = Clock::now();
+                (void) tp_d1; (void) tp_d3;
+            } else {
             // Attention projections (quantize/convert unique input vectors ONCE per layer)
             const auto tp_d1 = Clock::now();
             const void* xq_k_src = (ink_src == in_q) ? xq : xq_k;
@@ -2940,9 +4006,8 @@ struct Engine {
                 }
             }
 
-            float* hst = conv_hist[(size_t) il];
-            float* h_tr = save_conv_trace ? (d_conv_trace + (size_t) il * layer_conv_floats) : nullptr;
             if (prof_detail) { CK(cudaStreamSynchronize(st)); p_d_qkv += ms_since(tp_d1); }
+            if (evp) cudaEventRecord(ev_t[il][2], st);
             const auto tp_d2 = Clock::now();
             const int apply_tau = is_swa ? 0 : 1;
             const bool fused_kv_q8 = (T < 32 && kv_q8 && hp.head_dim == 128);
@@ -3017,7 +4082,7 @@ struct Engine {
                         att_xq_ready = xq;
                     } else if (is_swa && T >= 1 && T <= 8) {
 #else
-                    if (is_swa && T >= 1 && T <= 8) {
+                    if (is_swa && T >= 2 && T <= 8) {
 #endif
                         k_attn_q8_gqa3_swa_1pass<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
                             pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink,
@@ -3163,18 +4228,26 @@ struct Engine {
                     (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il], is_swa ? 1 : 0, (int) hp.n_swa, pos0_d, kq_scale);
             }
             if (prof_detail) { CK(cudaStreamSynchronize(st)); p_d_attn += ms_since(tp_d2); }
+            if (evp) cudaEventRecord(ev_t[il][3], st);
 
             const auto tp_d3 = Clock::now();
             if (!kv_q8) {
                 k_mul_sigmoid<<<(unsigned) (((int64_t) T * q_dim + 255) / 256), 256, 0, st>>>(att, pGate, (int64_t) T * q_dim);
             }
             project_preq(att, att_xq_ready, L.attn_output, wo, T, N, q_dim);
+            }
             const bool do_push = (ip % hp.attn_res_block_size == 0);
             if (T >= 32 && !save_conv_trace) {
                 k_shortconv_pp<<<dim3((unsigned) ((N + 255) / 256), (unsigned) ((T + 15) / 16)), 256, 0, st>>>(
                     wo, L.attn_post_conv, hst, ffn_inp, N, 2 * (int) kv_dim, T, do_push ? nullptr : cur);
                 k_shortconv_hist_push<<<(unsigned) ((N + 255) / 256), 256, 0, st>>>(
                     wo, hst, N, 2 * (int) kv_dim, T);
+            } else if (use_p2p_spin && !save_conv_trace) {
+#if defined(__HIP_PLATFORM_AMD__)
+                k_p2p_wait_add_shortconv_t1<<<1, 576, 0, st>>>(
+                    peer.fg_flag0, (uint32_t) (il * 2 + 1), wo, peer.fg_wo_from_peer,
+                    L.attn_post_conv, hst, ffn_inp, (int) N, 2 * (int) kv_dim, do_push ? nullptr : cur);
+#endif
             } else {
                 k_shortconv<<<(unsigned) ((N + 63) / 64), 64, 0, st>>>(wo, L.attn_post_conv, nullptr, hst, ffn_inp, N, 2 * (int) kv_dim, 0, T, do_push ? nullptr : cur, h_tr, total_conv_floats);
             }
@@ -3185,7 +4258,9 @@ struct Engine {
             run_mix_normed(norm_blocks, ffn_inp, false, L.ffn_res_query, ffn_mix_out, 1, T, 0);
             if (has_msg) run_control(in_ffn, msg3, L, 3, in_ffn, T);
             if (T <= 8 && !include_route_t1 && (N & 31) == 0) {
-                k_rms_norm_q8_1<<<(unsigned) T, rms_q8_blk, 0, st>>>(in_ffn, L.ffn_norm, in_ffn, xq, N, hp.rms_eps);
+                k_rms_norm_q8_1<<<(unsigned) T, rms_q8_blk, 0, st>>>(
+                    in_ffn, L.ffn_norm, in_ffn, xq, N, hp.rms_eps,
+                    nullptr, (use_p2p_spin && N == 2304) ? peer.fg_xq_q : nullptr, nullptr, 0);
             } else if (T >= 16 && (N & 3) == 0) {
                 k_rms_norm_f16<<<(unsigned) T, kThreads, 0, st>>>(in_ffn, L.ffn_norm, in_ffn, act_bf16, N, hp.rms_eps);
             } else {
@@ -3201,7 +4276,8 @@ struct Engine {
                 CK(cudaMemcpyAsync(h_ids, ids, (size_t) Kp * sizeof(int32_t), cudaMemcpyDeviceToHost, st));
                 CK(cudaMemcpyAsync(h_ewts, ewts, (size_t) Kp * sizeof(float), cudaMemcpyDeviceToHost, st));
             }
-            if (prof_detail) { CK(cudaStreamSynchronize(st)); p_d_out += ms_since(tp_d3); }
+            if (prof_detail) { CK(cudaStreamSynchronize(st)); p_d_out += ms_since(tp_d3_outer); }
+            if (evp) cudaEventRecord(ev_t[il][4], st);
         };
 
         auto advance_pre_meta = [&](int il) {
@@ -3231,8 +4307,8 @@ struct Engine {
             const bool is_hy = (L.n_slots < hp.n_expert);
             const bool xq_ffn_ready = (T <= 8 && !pre_routed_t1 && (N & 31) == 0);
             const bool f16_ffn_ready = (T >= 16 && (N & 3) == 0);
-            const bool fuse_comb_conv = (!is_hy && T <= 8);
-            run_moe(L, il, in_ffn, T, pre_routed_t1, xq_ffn_ready, fuse_comb_conv, f16_ffn_ready);
+            const bool fuse_comb_conv = (!is_hy && !L.tp_moe && T <= 8);
+            run_moe(L, il, in_ffn, T, pre_routed_t1, xq_ffn_ready, fuse_comb_conv, f16_ffn_ready, use_p2p_spin);
             const auto tp_mp0 = Clock::now();
             if (fuse_comb_conv) {
                 k_combine_experts_shortconv<<<(unsigned) ((N + 63) / 64), 64, 0, st>>>(
@@ -3243,6 +4319,12 @@ struct Engine {
                     moe_raw, L.ffn_post_conv, hst, cur, N, 2 * (int) kv_dim + N, T, ffn_inp);
                 k_shortconv_hist_push<<<(unsigned) ((N + 255) / 256), 256, 0, st>>>(
                     moe_raw, hst, N, 2 * (int) kv_dim + N, T);
+            } else if (use_p2p_spin && !save_conv_trace) {
+#if defined(__HIP_PLATFORM_AMD__)
+                k_p2p_wait_add_shortconv_t1<<<1, 576, 0, st>>>(
+                    peer.fg_flag0, (uint32_t) (il * 2 + 2), moe_raw, peer.fg_moe_from_peer,
+                    L.ffn_post_conv, hst, cur, (int) N, 2 * (int) kv_dim + (int) N, ffn_inp);
+#endif
             } else {
                 k_shortconv<<<(unsigned) ((N + 255) / 256), 256, 0, st>>>(moe_raw, L.ffn_post_conv, nullptr, hst, cur, N, 2 * (int) kv_dim + N, 0, T, ffn_inp, h_tr, total_conv_floats);
             }
@@ -3259,7 +4341,7 @@ struct Engine {
         for (int il = 0; il < hp.n_layer; ++il) {
             const bool use_t1_core = (T == 1 && !capture_dspark);
             const bool use_vf_core = (verify_max_t > 1 && T == verify_max_t && save_conv_trace && capture_dspark);
-            if ((use_t1_core || use_vf_core) && core_all_gpu && !prof_detail && il == hp.core_start && n_core > 0) {
+            if ((use_t1_core || use_vf_core) && core_all_gpu && !m->tp_moe && !peer.tp_attn && !prof_detail && !(ev_prof_en && ev_prof_step == 32) && il == hp.core_start && n_core > 0) {
                 cudaGraphExec_t& cg = use_t1_core ? core_graph : verify_core_graph;
                 if (!cg) {
                     cudaGraph_t g = nullptr;
@@ -3282,7 +4364,7 @@ struct Engine {
                 continue;
             }
             const bool is_outer = (il < hp.core_start || il >= core_end_virt);
-            const bool use_pre_graph = (T == 1 && hybrid && !prof_detail && !pp_streaming && !capture_dspark);
+            const bool use_pre_graph = (T == 1 && hybrid && !prof_detail && !(ev_prof_en && ev_prof_step == 32) && !pp_streaming && !capture_dspark);
             const int ip_cur = hp.loop_layer(il);
             const bool include_route_t1 = use_pre_graph && (m->layers[(size_t) ip_cur].n_slots < hp.n_expert);
             const auto tp_ly0 = Clock::now();
@@ -3326,6 +4408,7 @@ struct Engine {
                 else p_core_ms += ms_since(tp_ly0);
             }
             run_layer_post(il, include_route_t1);
+            if (T == 1 && ev_prof_en && ev_prof_step == 32 && il < 64) cudaEventRecord(ev_t[il][5], st);
         }
 
         // Output head (skip 200K vocab matmul + sync on intermediate prefill chunks where only KV/DSpark states are needed)
@@ -3337,7 +4420,13 @@ struct Engine {
             float* out_head[1] = {in_ffn};
             run_mix_normed(norm_blocks, cur, false, m->output_res_query, out_head, 1, T, 0);
             if (fuse_head_q8) {
-                k_rms_norm_q8_1<<<(unsigned) T, (N == 2304) ? 768 : kThreads, 0, st>>>(in_ffn, m->output_norm, cur, xq, N, hp.rms_eps);
+                const bool push_hd_p2p = (use_p2p_spin && N == 2304);
+                k_rms_norm_q8_1<<<(unsigned) T, (N == 2304) ? 768 : kThreads, 0, st>>>(
+                    in_ffn, m->output_norm, cur, xq, N, hp.rms_eps,
+                    nullptr,
+                    push_hd_p2p ? peer.fg_xq_q : nullptr,
+                    push_hd_p2p ? peer.fg_flag1 : nullptr,
+                    push_hd_p2p ? (uint32_t) (hp.n_layer * 2 + 1) : 0u);
             } else {
                 k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_ffn, m->output_norm, cur, N, hp.rms_eps);
             }
@@ -3353,31 +4442,159 @@ struct Engine {
             return 0;
         }
         const float* head_h = (rows == T) ? cur : (cur + (size_t) (T - 1) * N);
-        project_preq(head_h, fuse_head_q8 ? xq : nullptr, m->output_weight, logits, rows, hp.vocab_unpadded, N);
-        const int64_t tot_lg = (int64_t) rows * hp.vocab_unpadded;
-        if (copy_logits && hp.softcap > 0.0f) {
-            k_softcap<<<(unsigned) ((tot_lg + 255) / 256), 256, 0, st>>>(logits, tot_lg, hp.softcap);
-        }
-        if (hp.vocab_unpadded >= 4096 && argmax_val && argmax_idx && rows <= verify_max_t) {
-            constexpr int kArgBlks = 64;
-            k_argmax_stage1<<<dim3(kArgBlks, (unsigned) rows), 256, 0, st>>>(
-                logits, argmax_val, argmax_idx, (int) hp.vocab_unpadded);
-            k_argmax_stage2<<<(unsigned) rows, 32, 0, st>>>(
-                argmax_val, argmax_idx, pick_d, kArgBlks);
-        } else {
-            k_argmax<<<(unsigned) rows, 256, 0, st>>>(logits, pick_d, (int) hp.vocab_unpadded);
-        }
         std::vector<int32_t> tmp_picks((size_t) rows, 0);
-        if (copy_logits && out_logits) {
-            out_logits->resize((size_t) tot_lg);
-            CK(cudaMemcpyAsync(out_logits->data(), logits, (size_t) tot_lg * sizeof(float), cudaMemcpyDeviceToHost, st));
+        const int64_t tot_lg = (int64_t) rows * hp.vocab_unpadded;
+#if defined(__HIP_PLATFORM_AMD__)
+        if (use_p2p_spin) {
+            const uint32_t step_h = (uint32_t) (hp.n_layer * 2 + 1);
+            const void* head_xq = fuse_head_q8 ? xq : nullptr;
+            if (!head_xq) {
+                prep_q8(head_h, xq, 1, N);
+                head_xq = xq;
+            }
+            const size_t q8_bytes = ((size_t) N / 32) * 36;
+            if (!(fuse_head_q8 && N == 2304)) k_p2p_push_head_in<<<1, 256, 0, st>>>(peer.fg_xq_q, head_xq, (int) q8_bytes, peer.fg_flag1, step_h);
+            project_preq(head_h, head_xq, m->output_weight, logits, 1, m->vocab_tp0, N);
+            constexpr int kArgBlks = 64;
+            k_argmax_stage1<<<dim3(kArgBlks, 1), 256, 0, st>>>(logits, argmax_val, argmax_idx, (int) m->vocab_tp0);
+            k_argmax_stage2<<<1, 32, 0, st>>>(argmax_val, argmax_idx, pick_d, kArgBlks);
+
+            CK(cudaSetDevice(peer.dev));
+            k_p2p_wait<<<1, 1, 0, peer.st>>>(peer.fg_flag1, step_h);
+            K::native_mmvq(m->peer_output_weight.type, m->peer_output_weight.d, peer.fg_xq_q, peer.logits,
+                           (int) N, (int) m->vocab_tp1, 1, peer.st);
+            k_argmax_stage1<<<dim3(kArgBlks, 1), 256, 0, peer.st>>>(peer.logits, peer.argmax_val, peer.argmax_idx, (int) m->vocab_tp1);
+            k_argmax_stage2<<<1, 32, 0, peer.st>>>(peer.argmax_val, peer.argmax_idx, peer.pick_d, kArgBlks);
+            k_p2p_push_head_res<<<1, 1, 0, peer.st>>>(peer.logits, peer.pick_d, peer.fg_flag1,
+                                                      peer.fg_head_val, peer.fg_head_idx, peer.fg_flag0, step_h);
+
+            CK(cudaSetDevice(peer.primary_dev));
+            k_p2p_wait_head_merge<<<1, 1, 0, st>>>(peer.fg_flag0, step_h, logits, pick_d,
+                                                   peer.fg_head_val, peer.fg_head_idx, (int32_t) m->vocab_tp0);
+
+            if (capturing_tp_graph) {
+                cudaGraph_t g0 = nullptr, g1 = nullptr;
+                CK(cudaSetDevice(peer.primary_dev));
+                CK(cudaStreamEndCapture(st, &g0));
+                CK(cudaGraphInstantiate(&peer.tp_graph0, g0, nullptr, nullptr, 0));
+                CK(cudaGraphDestroy(g0));
+                CK(cudaSetDevice(peer.dev));
+                CK(cudaStreamEndCapture(peer.st, &g1));
+                CK(cudaGraphInstantiate(&peer.tp_graph1, g1, nullptr, nullptr, 0));
+                CK(cudaGraphDestroy(g1));
+                // Execute the newly captured dual graph for this first token!
+                CK(cudaGraphLaunch(peer.tp_graph1, peer.st));
+                CK(cudaSetDevice(peer.primary_dev));
+                CK(cudaGraphLaunch(peer.tp_graph0, st));
+            }
+            CK(cudaMemcpyAsync(tmp_picks.data(), pick_d, sizeof(int32_t), cudaMemcpyDeviceToHost, st));
+            CK(cudaStreamSynchronize(st));
+        } else
+#endif
+        if (m->vocab_tp1 > 0 && peer.dev >= 0 && rows <= 8) {
+            const void* head_xq = fuse_head_q8 ? xq : nullptr;
+            if (!head_xq) {
+                prep_q8(head_h, xq, rows, N);
+                head_xq = xq;
+            }
+            const size_t q8_bytes = (size_t) rows * ((size_t) N / 32) * 36;
+            if (!peer.p2p) CK(cudaMemcpyAsync(peer.h_x, head_xq, q8_bytes, cudaMemcpyDeviceToHost, st));
+            CK(cudaEventRecord(ev_route, st));
+
+            project_preq(head_h, head_xq, m->output_weight, logits, rows, m->vocab_tp0, N);
+            constexpr int kArgBlks = 64;
+            k_argmax_stage1<<<dim3(kArgBlks, (unsigned) rows), 256, 0, st>>>(logits, argmax_val, argmax_idx, (int) m->vocab_tp0);
+            k_argmax_stage2<<<(unsigned) rows, 32, 0, st>>>(argmax_val, argmax_idx, pick_d, kArgBlks);
+
+            CK(cudaSetDevice(peer.dev));
+            CK(cudaStreamWaitEvent(peer.st, ev_route, 0));
+            if (peer.p2p) CK(cudaMemcpyPeerAsync(peer.xq, peer.dev, head_xq, peer.primary_dev, q8_bytes, peer.st));
+            else CK(cudaMemcpyAsync(peer.xq, peer.h_x, q8_bytes, cudaMemcpyHostToDevice, peer.st));
+            K::native_mmvq(m->peer_output_weight.type, m->peer_output_weight.d, peer.xq, peer.logits,
+                           (int) N, (int) m->vocab_tp1, rows, peer.st);
+            k_argmax_stage1<<<dim3(kArgBlks, (unsigned) rows), 256, 0, peer.st>>>(peer.logits, peer.argmax_val, peer.argmax_idx, (int) m->vocab_tp1);
+            k_argmax_stage2<<<(unsigned) rows, 32, 0, peer.st>>>(peer.argmax_val, peer.argmax_idx, peer.pick_d, kArgBlks);
+            std::vector<int32_t> p1_picks((size_t) rows, 0);
+            CK(cudaMemcpyAsync(p1_picks.data(), peer.pick_d, (size_t) rows * sizeof(int32_t), cudaMemcpyDeviceToHost, peer.st));
+            CK(cudaEventRecord(peer.ev_done, peer.st));
+
+            CK(cudaSetDevice(peer.primary_dev));
+            CK(cudaMemcpyAsync(tmp_picks.data(), pick_d, (size_t) rows * sizeof(int32_t), cudaMemcpyDeviceToHost, st));
+            CK(cudaStreamSynchronize(st));
+            CK(cudaSetDevice(peer.dev));
+            CK(cudaStreamSynchronize(peer.st));
+            CK(cudaSetDevice(peer.primary_dev));
+
+            for (int r = 0; r < rows; ++r) {
+                float v0 = -1e30f, v1 = -1e30f;
+                CK(cudaMemcpy(&v0, logits + (size_t) r * m->vocab_tp0 + tmp_picks[(size_t) r], sizeof(float), cudaMemcpyDeviceToHost));
+                CK(cudaSetDevice(peer.dev));
+                CK(cudaMemcpy(&v1, peer.logits + (size_t) r * m->vocab_tp1 + p1_picks[(size_t) r], sizeof(float), cudaMemcpyDeviceToHost));
+                CK(cudaSetDevice(peer.primary_dev));
+                if (v1 > v0) tmp_picks[(size_t) r] = (int32_t) (m->vocab_tp0 + p1_picks[(size_t) r]);
+            }
+            if (copy_logits && out_logits) {
+                out_logits->resize((size_t) tot_lg);
+                for (int r = 0; r < rows; ++r) {
+                    CK(cudaMemcpy(out_logits->data() + (size_t) r * hp.vocab_unpadded,
+                                  logits + (size_t) r * m->vocab_tp0, (size_t) m->vocab_tp0 * sizeof(float), cudaMemcpyDeviceToHost));
+                    CK(cudaSetDevice(peer.dev));
+                    CK(cudaMemcpy(out_logits->data() + (size_t) r * hp.vocab_unpadded + m->vocab_tp0,
+                                  peer.logits + (size_t) r * m->vocab_tp1, (size_t) m->vocab_tp1 * sizeof(float), cudaMemcpyDeviceToHost));
+                    CK(cudaSetDevice(peer.primary_dev));
+                }
+                if (hp.softcap > 0.0f) {
+                    for (float& lv : *out_logits) lv = hp.softcap * std::tanh(lv / hp.softcap);
+                }
+            }
+        } else {
+            project_preq(head_h, fuse_head_q8 ? xq : nullptr, m->output_weight, logits, rows, hp.vocab_unpadded, N);
+            if (copy_logits && hp.softcap > 0.0f) {
+                k_softcap<<<(unsigned) ((tot_lg + 255) / 256), 256, 0, st>>>(logits, tot_lg, hp.softcap);
+            }
+            if (hp.vocab_unpadded >= 4096 && argmax_val && argmax_idx && rows <= verify_max_t) {
+                constexpr int kArgBlks = 64;
+                k_argmax_stage1<<<dim3(kArgBlks, (unsigned) rows), 256, 0, st>>>(
+                    logits, argmax_val, argmax_idx, (int) hp.vocab_unpadded);
+                k_argmax_stage2<<<(unsigned) rows, 32, 0, st>>>(
+                    argmax_val, argmax_idx, pick_d, kArgBlks);
+            } else {
+                k_argmax<<<(unsigned) rows, 256, 0, st>>>(logits, pick_d, (int) hp.vocab_unpadded);
+            }
+            if (copy_logits && out_logits) {
+                out_logits->resize((size_t) tot_lg);
+                CK(cudaMemcpyAsync(out_logits->data(), logits, (size_t) tot_lg * sizeof(float), cudaMemcpyDeviceToHost, st));
+            }
+            CK(cudaMemcpyAsync(tmp_picks.data(), pick_d, (size_t) rows * sizeof(int32_t), cudaMemcpyDeviceToHost, st));
+            CK(cudaStreamSynchronize(st));
         }
-        CK(cudaMemcpyAsync(tmp_picks.data(), pick_d, (size_t) rows * sizeof(int32_t), cudaMemcpyDeviceToHost, st));
-        CK(cudaStreamSynchronize(st));
         if (pp_streaming) sync_d_hits(true);
         if (out_picks) *out_picks = tmp_picks;
         if (prof) p_head_ms += ms_since(tp_h0);
         pos += T;
+        if (T == 1 && ev_prof_en) {
+            if (ev_prof_step == 32) {
+                cudaEventRecord(ev_t[48][0], st);
+                cudaStreamSynchronize(st);
+                float smix=0, sqkv=0, sattn=0, sout=0, smoe=0, shead=0, sfull=0, sswa=0;
+                int nfull=0, nswa=0;
+                for (int i = 0; i < hp.n_layer; ++i) {
+                    float d0=0, d1=0, d2=0, d3=0, d4=0;
+                    cudaEventElapsedTime(&d0, ev_t[i][0], ev_t[i][1]);
+                    cudaEventElapsedTime(&d1, ev_t[i][1], ev_t[i][2]);
+                    cudaEventElapsedTime(&d2, ev_t[i][2], ev_t[i][3]);
+                    cudaEventElapsedTime(&d3, ev_t[i][3], ev_t[i][4]);
+                    cudaEventElapsedTime(&d4, ev_t[i][4], ev_t[i][5]);
+                    smix += d0; sqkv += d1; sattn += d2; sout += d3; smoe += d4;
+                    if (hp.is_swa(i)) { sswa += d2; nswa++; } else { sfull += d2; nfull++; }
+                }
+                cudaEventElapsedTime(&shead, ev_t[hp.n_layer-1][5], ev_t[48][0]);
+                float tot = smix + sqkv + sattn + sout + smoe + shead;
+                std::fprintf(stderr, "EV_PROF (1 tok, zero host sync): total=%.2f ms (%.1f t/s) | mix=%.2f qkv=%.2f attn=%.2f (swa[%d]=%.2f full[%d]=%.2f) out=%.2f moe=%.2f head=%.2f\n",
+                             tot, 1000.0f/tot, smix, sqkv, sattn, nswa, sswa, nfull, sfull, sout, smoe, shead);
+            }
+            ev_prof_step++;
+        }
         return tmp_picks.back();
     }
 };
@@ -3477,7 +4694,10 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
     size_t tier1_full = 0;
     for (int ip : tier1) tier1_full += (size_t) ne * m.layers[(size_t) ip].stride;
     if (!tier1.empty()) {
-        if (E.peer.dev >= 0 && E.peer.balance_mode >= 2 &&
+        if (m.tp_moe && used + tier1_full <= budget && peer_budget >= tier1_full) {
+            for (int ip : tier1) slots[(size_t) ip] = ne;
+            used += tier1_full;
+        } else if (E.peer.dev >= 0 && E.peer.balance_mode >= 2 &&
             used + tier1_full / 2 <= budget && peer_budget >= tier1_full / 2) {
             const int half = ne / 2;
             for (int ip : tier1) {
@@ -3515,7 +4735,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
         size_t sum_tier2_stride = 0;
         for (int ip : tier2) sum_tier2_stride += m.layers[(size_t) ip].stride;
         int t2_cap = ne;
-        if (E.peer.dev >= 0 && E.peer.balance_mode >= 1 && peer_budget >= (size_t) (ne - ne / 2) * sum_tier2_stride) {
+        if (!m.tp_moe && E.peer.dev >= 0 && E.peer.balance_mode >= 1 && peer_budget >= (size_t) (ne - ne / 2) * sum_tier2_stride) {
             t2_cap = ne / 2;
         }
         const int s = sum_tier2_stride > 0 ? (int) std::min<size_t>((size_t) t2_cap, (budget - used) / sum_tier2_stride) : 0;
@@ -3616,8 +4836,9 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
         L.peer_slots = 0;
 
         int ps = 0;
-        if (s < ne && E.peer.dev >= 0 && L.gu_type != 30 && peer_rem >= L.stride) {
-            ps = (int) std::min<size_t>((size_t) (ne - s), peer_rem / L.stride);
+        if ((L.tp_moe || s < ne) && E.peer.dev >= 0 && L.gu_type != 30 && peer_rem >= L.stride) {
+            const int want_ps = L.tp_moe ? ne : (ne - s);
+            ps = (int) std::min<size_t>((size_t) want_ps, peer_rem / L.stride);
             void* pdbl = nullptr;
             CK(cudaSetDevice(E.peer.dev));
             while (ps > 0 && cudaMalloc(&pdbl, (size_t) ps * L.stride) != cudaSuccess) {
@@ -3639,7 +4860,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
         }
         L.peer_slots = ps;
 
-        if (s + ps < ne) {
+        if (L.tp_moe ? (s < ne || ps < ne) : (s + ps < ne)) {
             need_cpu = true;
             const size_t hb_bytes = (size_t) ne * L.stride;
             const bool want_pin = (std::getenv("STRATA_NO_PIN_EXPERTS") == nullptr) && (pinned_used + hb_bytes <= max_pin_bytes);
@@ -3663,7 +4884,13 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
         if (s > 0) {
             tmp.resize(L.L.bytes);
             for (int k = 0; k < s; ++k) {
-                const uint8_t* src = L.hblobs ? (L.hblobs + (size_t) k * L.stride) : (build_expert_blob(L, k, tmp.data()), tmp.data());
+                const uint8_t* src = nullptr;
+                if (L.tp_moe) {
+                    build_expert_blob_half(L, k, 0, tmp.data());
+                    src = tmp.data();
+                } else {
+                    src = L.hblobs ? (L.hblobs + (size_t) k * L.stride) : (build_expert_blob(L, k, tmp.data()), tmp.data());
+                }
                 CK(cudaMemcpy(L.d_blobs + (size_t) k * L.stride, src, L.L.bytes, cudaMemcpyHostToDevice));
                 L.slot_of[(size_t) k] = k;
                 L.exp_in_slot[(size_t) k] = k;
@@ -3675,8 +4902,14 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
             tmp.resize(L.L.bytes);
             CK(cudaSetDevice(E.peer.dev));
             for (int k = 0; k < ps; ++k) {
-                const int e = s + k;
-                const uint8_t* src = L.hblobs ? (L.hblobs + (size_t) e * L.stride) : (build_expert_blob(L, e, tmp.data()), tmp.data());
+                const int e = L.tp_moe ? k : (s + k);
+                const uint8_t* src = nullptr;
+                if (L.tp_moe) {
+                    build_expert_blob_half(L, e, 1, tmp.data());
+                    src = tmp.data();
+                } else {
+                    src = L.hblobs ? (L.hblobs + (size_t) e * L.stride) : (build_expert_blob(L, e, tmp.data()), tmp.data());
+                }
                 CK(cudaMemcpy(L.peer_blobs + (size_t) k * L.stride, src, L.L.bytes, cudaMemcpyHostToDevice));
                 L.peer_slot_of[(size_t) e] = k;
             }
@@ -4058,7 +5291,7 @@ int run(int argc, char** argv) {
 
     Model m;
     std::string err;
-    if (!load_model(model_path, m, err)) {
+    if (!load_model(model_path, m, err, peer_device, kv_q8)) {
         std::fprintf(stderr, "strata-inkling2: load failed: %s\n", err.c_str());
         return 1;
     }
@@ -4142,6 +5375,9 @@ int run(int argc, char** argv) {
         if (!E.peer.init(cur_dev, peer_device, peer_reserve_mib, peer_balance, chunk, m.hp, err)) {
             std::fprintf(stderr, "strata-inkling2: peer init failed: %s\n", err.c_str());
             return 1;
+        }
+        if (m.tp_attn) {
+            E.peer.init_tp_attn(m.hp, chunk, E.kv_cap, E.attn_split_slots);
         }
     }
     if (dm) {
