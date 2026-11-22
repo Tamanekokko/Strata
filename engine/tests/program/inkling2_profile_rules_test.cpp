@@ -175,6 +175,55 @@ int main() {
         check(p.full_kv_init == 16384, "16K ctx still allocates 16K KV upfront");
     }
 
+    // 9. AMD RX 9060 XT 16GB (RDNA4 gfx1200, HIP) @ 65K / 131K / 262K
+    {
+        ProfileInput in;
+        in.cc_major = 12;
+        in.cc_minor = 0;
+        in.sm_count = 16;
+        in.is_hip = true;
+        in.vram_total_bytes = 16 * GiB;
+        in.vram_free_bytes = (size_t) (14.4 * (double) GiB);
+        in.max_ctx = 65536;
+        in.kv_q8 = true;
+        in.tier1_experts_bytes = kTier1Bytes;
+        in.all_experts_bytes = kAllExpBytes;
+
+        const auto p65 = resolve_inkling2_profile(in);
+        std::printf("%s\n", format_profile_line(in, p65).c_str());
+        check(p65.arch.id == ArchId::HipRdna4, "RX 9060 XT selects HipRdna4 arch");
+        check(p65.regime == VramRegime::CoreResidentHybrid, "RX 9060 XT 16GB @ 65K selects CoreResidentHybrid");
+        check(p65.chunk == 1024 && p65.full_kv_init == 65536, "RX 9060 XT 65K uses chunk=1024 and upfront 65K KV");
+        check(p65.kv_grow_reserve_mib == 384, "RX 9060 XT keeps 384 MiB KV grow reserve for hipBLASLt");
+
+        in.max_ctx = 262144;
+        const auto p262 = resolve_inkling2_profile(in);
+        std::printf("%s\n", format_profile_line(in, p262).c_str());
+        check(p262.arch.id == ArchId::HipRdna4, "RX 9060 XT 262K keeps HipRdna4 arch");
+        check(p262.regime == VramRegime::CoreResidentHybrid, "RX 9060 XT 16GB @ 262K stays CoreResidentHybrid");
+        check(p262.full_kv_init == 262144, "RX 9060 XT 16GB @ 262K fits upfront 262K KV with core resident");
+    }
+
+    // 10. AMD RDNA3 (gfx1100, HIP) selects HipRdna3 arch
+    {
+        ProfileInput in;
+        in.cc_major = 11;
+        in.cc_minor = 0;
+        in.sm_count = 48;
+        in.is_hip = true;
+        in.vram_total_bytes = 24 * GiB;
+        in.vram_free_bytes = (size_t) (22.0 * (double) GiB);
+        in.max_ctx = 262144;
+        in.kv_q8 = true;
+        in.tier1_experts_bytes = kTier1Bytes;
+        in.all_experts_bytes = kAllExpBytes;
+
+        const auto p = resolve_inkling2_profile(in);
+        std::printf("%s\n", format_profile_line(in, p).c_str());
+        check(p.arch.id == ArchId::HipRdna3, "RDNA3 24GB selects HipRdna3 arch");
+        check(p.regime == VramRegime::FullVram, "RDNA3 24GB @ 262K fits FullVram");
+    }
+
     if (fails > 0) {
         std::printf("FAILED: %d check(s)\n", fails);
         return 1;

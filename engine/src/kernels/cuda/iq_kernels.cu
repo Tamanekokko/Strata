@@ -8582,5 +8582,10 @@ namespace strata::kernels {
 bool gemm_iq_f16_grouped(int, const void*, size_t, int, int, const void*, int, const int32_t*, int, int, float*, int, void*) {
     return false;
 }
+bool native_expert_grouped_wmma(const NativeExpertLayout&, const unsigned long long*, const int32_t*,
+                                const int32_t*, const int32_t*, const int32_t*,
+                                int64_t, int64_t, const void*, void*, float*, void*, int64_t) {
+    return false;
+}
 }  // namespace strata::kernels
 #endif

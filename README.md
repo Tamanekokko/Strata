@@ -2,11 +2,12 @@
 
 # Strata — Inkling-2-Mini Edition
 
-**High-throughput, long-context CUDA + AVX2 hybrid inference for Inkling-2-Mini.**
+**High-throughput, long-context CUDA / ROCm (HIP) + AVX2 hybrid inference for Inkling-2-Mini.**
 
-[![Repository](https://img.shields.io/badge/Repo-kuraneko1%2FStrata-0ab887)](https://github.com/kuraneko1/Strata)
+[![Repository](https://img.shields.io/badge/Repo-Tamanekokko%2FStrata-0ab887)](https://github.com/Tamanekokko/Strata)
+[![Upstream](https://img.shields.io/badge/Fork%20of-kuraneko1%2FStrata-475569)](https://github.com/kuraneko1/Strata)
 [![Engine](https://img.shields.io/badge/Engine-strata--inkling2-2563eb)](docs/INKLING2.md)
-[![Verified GPUs](https://img.shields.io/badge/Verified-RTX%204070%2012GB%20%C2%B7%20V100%2032GB-6d28d9)](#supported-hardware--auto-profiles)
+[![Verified GPUs](https://img.shields.io/badge/Verified-RX%209060%20XT%2016GB%20%C2%B7%20RTX%204070%2012GB%20%C2%B7%20V100%2032GB-6d28d9)](#supported-hardware--auto-profiles)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 [Highlights](#highlights) · [Profiles](#supported-hardware--auto-profiles) · [Benchmarks](#benchmarks) · [Build](#build-from-source) · [Quick Start](#quick-start) · [Architecture](#architecture--optimizations)
@@ -15,9 +16,9 @@
 
 ---
 
-**`kuraneko1/Strata`** is a fork of [Niko1221/Strata](https://github.com/Niko1221/Strata) focused on **`strata-inkling2`**: a dedicated CUDA + AVX2 hybrid inference engine for the **Inkling-2-Mini** (`inkling2`) looped-MoE architecture.
+**`Tamanekokko/Strata`** is a ROCm/HIP-enabled fork of [kuraneko1/Strata](https://github.com/kuraneko1/Strata) (upstream [Niko1221/Strata](https://github.com/Niko1221/Strata)) adding **single-GPU AMD Radeon (ROCm/HIP)** support to **`strata-inkling2`**, including RDNA4 WMMA prefill attention and automatic `rdna4` / `rdna3` VRAM profiling.
 
-It runs **65K–262K** context on a single **12 GB consumer GPU (RTX 4070)** and **819K–1M** context on a **32 GB Tesla V100** with **zero quantization or precision changes**, served behind an OpenAI- and Anthropic-compatible HTTP API and built-in Web UI (`serve.server`).
+It runs **65K–262K** context on a single **16 GB AMD Radeon RX 9060 XT (ROCm/HIP)** or **12 GB RTX 4070 (CUDA)**, and **819K–1M** context on a **32 GB Tesla V100** with **zero quantization or precision changes**, served behind an OpenAI- and Anthropic-compatible HTTP API and built-in Web UI (`serve.server`).
 
 ## Highlights
 
@@ -28,7 +29,7 @@ It runs **65K–262K** context on a single **12 GB consumer GPU (RTX 4070)** and
 
 ## Supported Hardware & Auto-Profiles
 
-The profile selector separates **SM architecture** (`sm70`, `sm89`, `generic`) from **VRAM regime** (`full_vram`, `core_resident_hybrid`, `tight_hybrid`) so tuning for 12 GB Ada GPUs never regresses 32 GB Volta GPUs (and vice versa).
+The profile selector separates **GPU architecture** (`sm70`, `sm89`, `generic`, `rdna4`, `rdna3`, `hip_generic`) from **VRAM regime** (`full_vram`, `core_resident_hybrid`, `tight_hybrid`) so tuning for 12 GB Ada GPUs never regresses 32 GB Volta GPUs (and vice versa).
 
 | Verified GPU | `--max-context` | Auto-Resolved Profile | Prefill Chunk | KV Cache Strategy | Expert Placement |
 | --- | ---: | --- | ---: | --- | --- |
@@ -37,12 +38,31 @@ The profile selector separates **SM architecture** (`sm70`, `sm89`, `generic`) f
 | **RTX 4070 12 GB** (`sm_89`) | `262144` | `sm89 + tight_hybrid` | `2048` | Dynamic `32K → 262K` | Adaptive eviction (`74.9%` hit @ 262K) |
 | **Tesla V100 32 GB** (`sm_70`) | `819200` (+ DSpark) | `sm70 + full_vram` | `1024` | Upfront `819K` | `3,072 / 3,072` (`100%` VRAM, `916 MiB` free) |
 | **Tesla V100 32 GB** (`sm_70`) | `1048576` | `sm70 + core_resident_hybrid` | `1024` | Dynamic | `2,897 / 3,072` (`tier1` 100%) |
+| **RX 9060 XT 16 GB** (`gfx1200`, HIP) | `65536` | `rdna4 + core_resident_hybrid` | `1024` | Upfront `65K` (0s growth) | `2,734 / 3,072` (`tier1` 100%, `tier2` 99–101/128) |
+| **RX 9060 XT 16 GB** (`gfx1200`, HIP) | `131072` | `rdna4 + core_resident_hybrid` | `1024` | Upfront `131K` (0s growth) | `2,521 / 3,072` (`tier1` 100%, `tier2` 82–83/128) |
+| **RX 9060 XT 16 GB** (`gfx1200`, HIP) | `262144` | `rdna4 + core_resident_hybrid` | `1024` | Upfront `262K` (0s growth) | `2,098 / 3,072` (`tier1` 100%, `tier2` 46–48/128) |
 
+> **AMD Radeon GPUs (ROCm / HIP, single GPU)**: Hardware-verified in this fork on **Radeon RX 9060 XT 16 GB** (`gfx1200`, RDNA4) with wave32 RDNA4 WMMA Q8-KV prefill attention and automatic 512 MiB `hipBLASLt` workspace reserve. RDNA3 (`gfx11xx`, e.g. RX 7900 XTX / RX 7800 XT) maps to the `rdna3` profile with WMMA support (unverified on hardware); other ROCm GPUs are designed to fall back to `hip_generic` (unverified on hardware).
+>
+> **NVIDIA GPUs**: The RTX 4070 12 GB and Tesla V100 32 GB results below are upstream measurements from [kuraneko1/Strata](https://github.com/kuraneko1/Strata) (not re-benchmarked on NVIDIA hardware after this ROCm/HIP patch).
+>
 > **Other NVIDIA GPUs (`sm_75+`)**: Turing (`sm_75`), Ampere (`sm_86`), other Ada (`sm_89`), and Blackwell (`sm_120`, CUDA 13+) GPUs build and run via the safe `generic` profile and automatic VRAM sizing. Hardware verification and dedicated profiles currently cover **RTX 4070 12 GB** and **Tesla V100 32 GB**.
 
 ## Benchmarks
 
 All numbers measured on real hardware with `Inkling-2-Mini-UD-Q4_K_M.gguf` (`--kv-q8`, zero quantization change).
+
+### AMD Radeon RX 9060 XT 16 GB (`gfx1200`, Single GPU, Ryzen 5 7600, ROCm 10.1.0, DSpark OFF)
+
+Measured with `--bench --kv-q8 --max-new 64` on a 4,096-token prompt (default settings, no environment variable overrides; `tier1` 128/128 core experts resident in VRAM across all three context tiers):
+
+| Mode (`--max-context`) | Prefill (4K tok) | Decode (64 tok) | VRAM Expert Placement | Free VRAM |
+| --- | ---: | ---: | --- | ---: |
+| **`65536`** (`rdna4 + core_resident_hybrid`, `T=1024`) | **`527.2 t/s`** | **`42.3 t/s`** | `2,734 / 3,072` (`tier1` 100%, `tier2` 99–101/128) | `504 MiB` |
+| **`131072`** (`rdna4 + core_resident_hybrid`, `T=1024`) | **`521.3 t/s`** | **`40.7 t/s`** | `2,521 / 3,072` (`tier1` 100%, `tier2` 82–83/128) | `502 MiB` |
+| **`262144`** (`rdna4 + core_resident_hybrid`, `T=1024`) | **`513.9 t/s`** | **`37.8 t/s`** | `2,098 / 3,072` (`tier1` 100%, `tier2` 46–48/128) | `504 MiB` |
+
+> **ROCm / HIP optimizations**: Includes a wave32-safe `hip_compat/mma.h` (`__builtin_amdgcn_wmma_f32_16x16x16_f16` on gfx11/gfx12), sub-warp mask fix in `hip_compat/intrinsics.hpp`, RDNA4/RDNA3 auto-profiles, and a 512 MiB VRAM reserve so `hipBLASLt` loads `TensileLibrary` cleanly out of the box (`+69.8%` prefill at 65K: `310.5 t/s` scalar fallback without `hipBLASLt` → `527.2 t/s` with WMMA + `hipBLASLt`).
 
 ### RTX 4070 12 GB (`sm_89`, Ryzen 7 5700X, DSpark OFF)
 
@@ -84,11 +104,24 @@ Full V100 800K progression, Roofline analysis & chart: [2026-11-22 V100 800K Rep
 
 ## Build from Source
 
-Requires **Linux x86_64** (AVX2 CPU), **CMake 3.24+**, a **C++20** compiler, and the **CUDA Toolkit** (CUDA 12.x/13.x for `sm_75+`; CUDA 12.x required for `sm_70` V100).
+Requires **Linux x86_64** (AVX2 CPU), **CMake 3.24+**, a **C++20** compiler, and either **ROCm / HIP** (for AMD Radeon GPUs) or the **CUDA Toolkit** (CUDA 12.x/13.x for `sm_75+`; CUDA 12.x required for `sm_70` V100).
 
 ```bash
-git clone https://github.com/kuraneko1/Strata.git
+git clone https://github.com/Tamanekokko/Strata.git
 cd Strata
+```
+
+### 0. AMD Radeon Single GPU (ROCm / HIP — RX 9060 XT / RDNA4 / RDNA3)
+
+Requires ROCm with `hipcc`, `rocBLAS`, and `hipBLASLt` (verified on ROCm 10.1.0 with RX 9060 XT `gfx1200`). Pass `-DCMAKE_PREFIX_PATH=/opt/rocm` (or your ROCm install prefix) if CMake does not locate ROCm automatically.
+
+```bash
+cmake -S engine -B engine/build-hip \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DSTRATA_ENABLE_HIP=ON \
+  -DCMAKE_HIP_ARCHITECTURES=gfx1200   # gfx1200 (RX 9060 XT), gfx1201 (RX 9070 / 9070 XT); RDNA3: gfx1100/gfx1101/gfx1102
+
+cmake --build engine/build-hip --target strata-inkling2 -j
 ```
 
 ### 1. Local NVIDIA GPU (`sm_75+`, e.g. RTX 4070)
@@ -144,7 +177,7 @@ Create a JSON config (e.g. `inkling2.json`). Simply change `--max-context` to sw
 {
   "arch": "inkling2",
   "model_name": "Inkling-2-Mini-UD-Q4_K_M",
-  "exe": "/path/to/Strata/engine/build/strata-inkling2",
+  "exe": "/path/to/Strata/engine/build-hip/strata-inkling2",
   "args": [
     "--model", "/path/to/Inkling-2-Mini-UD-Q4_K_M.gguf",
     "--max-context", "262144",
@@ -162,6 +195,7 @@ Create a JSON config (e.g. `inkling2.json`). Simply change `--max-context` to sw
 ```
 
 Recommended `--max-context` presets:
+- **RX 9060 XT 16 GB (ROCm / HIP) — 65K / 131K / 262K**: `"--max-context", "65536"` (or `"131072"` / `"262144"`; `tier1` stays 100% resident in VRAM up to 262K)
 - **RTX 4070 12 GB — fastest daily coding (`65K`)**: `"--max-context", "65536"`
 - **RTX 4070 12 GB — balanced long context (`131K`)**: `"--max-context", "131072"`
 - **RTX 4070 12 GB — max context (`262K`)**: `"--max-context", "262144"`
@@ -191,6 +225,12 @@ Point any OpenAI- or Anthropic-compatible client (Claude Code, Codex CLI, OpenCo
 Change only `--max-context` (and optionally `--draft` on 32 GB GPUs) — the engine auto-selects the matching profile, chunk size, and KV strategy.
 
 ```bash
+# AMD Radeon RX 9060 XT 16 GB (single GPU, ROCm / HIP) — 65K / 131K / 262K
+# (On systems with an iGPU or multiple GPUs, check device indices with `rocminfo` and set HIP_VISIBLE_DEVICES accordingly)
+HIP_VISIBLE_DEVICES=0 ./engine/build-hip/strata-inkling2 \
+  --model /path/to/Inkling-2-Mini-UD-Q4_K_M.gguf \
+  --max-context 65536 --kv-q8 --bench --max-new 64
+
 # RTX 4070 12 GB — 65K fastest (auto: sm89 + core_resident_hybrid, chunk=2048, ~2,014 PP / ~45–57 t/s Dec)
 ./engine/build/strata-inkling2 \
   --model /path/to/Inkling-2-Mini-UD-Q4_K_M.gguf \

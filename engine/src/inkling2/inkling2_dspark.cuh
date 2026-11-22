@@ -287,9 +287,13 @@ __device__ __forceinline__ void dspark_i8x4_to_h2x2_fma(uint32_t packed_i8x4, __
 }
 
 __device__ __forceinline__ float dspark_fast_exp2f_hw(float x) {
+#if defined(__HIP_PLATFORM_AMD__)
+    return exp2f(x);
+#else
     float y;
     asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
     return y;
+#endif
 }
 #endif
 
@@ -302,7 +306,8 @@ __global__ void __launch_bounds__(128, 6) k_dspark_attn_q8_sharedkv_split(
         const int8_t* __restrict__ vq_ctx, const __half* __restrict__ vs_ctx,
         const float* __restrict__ K_self, const float* __restrict__ V_self,
         float* __restrict__ split_out,
-        int n_head, int n_head_kv, int P, int block_n, float kq_scale, int split_n) {
+        int n_head, int n_head_kv, const int32_t* __restrict__ pos_d, int block_n, float kq_scale, int split_n) {
+    const int P = *pos_d;
     constexpr int BK = 16;
     __shared__ uint2 sK[BK][16];
     __shared__ uint2 sV[BK][16];
@@ -468,6 +473,7 @@ __global__ void __launch_bounds__(128, 6) k_dspark_attn_q8_sharedkv_split(
 /// 4 warps (128 thr, 4 blk/SM, 18,432 B SMEM, <= 128 regs, 0 spills): 2 row-tiles (rt=0..1) x 2 independent KV streams (kw=0..1),
 /// sharing 16x136 sKV[kw] via 64-thr bar.sync with ZERO __syncthreads(), ZERO sS/sP SMEM via wmma_acc_to_matA_16x16,
 /// V prefetch overlapping QK^T, direct FP16 self-block in sp == 0, and single 2-pass epilogue combine.
+#if !defined(__HIP_PLATFORM_AMD__)
 template <bool IS_SWA = false>
 __global__ void __launch_bounds__(128, 4) k_dspark_attn_q8_wmma_split(
         const float* __restrict__ Q,
@@ -1308,6 +1314,7 @@ __global__ void __launch_bounds__(128, 4) k_dspark_attn_q8_wmma_split(
     }
 #endif
 }
+#endif  // !__HIP_PLATFORM_AMD__
 
 /// Combine Split-KV partials for DSpark (+ optional direct Q8_1 store into xq_out): grid (n_head, block_n), block 128.
 /// Reads P = *pos_d dynamically from device memory for CUDA Graph capture.
@@ -1727,6 +1734,7 @@ struct DsparkEngine {
         cudaDeviceGetAttribute(&n_sm, cudaDevAttrMultiProcessorCount, dev);
         split_full = std::clamp((n_sm * 24) / std::max(1, hp.n_head_kv), 40, 240);
         d_f32(&split_out, (size_t) B * split_full * hp.n_head * 130);
+#if !defined(__HIP_PLATFORM_AMD__)
         cudaFuncSetAttribute(dspark_detail::k_dspark_attn_q8_wmma_split<false>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, 24576);
         cudaFuncSetAttribute(dspark_detail::k_dspark_attn_q8_wmma_split<false>,
@@ -1735,6 +1743,7 @@ struct DsparkEngine {
                              cudaFuncAttributeMaxDynamicSharedMemorySize, 24576);
         cudaFuncSetAttribute(dspark_detail::k_dspark_attn_q8_wmma_split<true>,
                              cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+#endif
         d_f32(&wo, (size_t) B * hp.n_embd);
         d_f32(&gate, (size_t) B * hp.n_ff);
         d_f32(&up, (size_t) B * hp.n_ff);
@@ -1885,20 +1894,33 @@ struct DsparkEngine {
                 const void* dspark_att_xq = nullptr;
                 if (use_split) {
                     if (!L.is_swa) {
+#if defined(__HIP_PLATFORM_AMD__)
+                        dspark_detail::k_dspark_attn_q8_sharedkv_split<<<dim3((unsigned) hp.n_head_kv, (unsigned) split_full), 128, 0, E.st>>>(
+                            Q, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], K, V, split_out,
+                            hp.n_head, hp.n_head_kv, pos_d, block_n, kq_scale, split_full);
+#else
                         dspark_detail::k_dspark_attn_q8_wmma_split<false><<<dim3((unsigned) hp.n_head_kv, (unsigned) split_full), 128, 18432, E.st>>>(
                             Q, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], K, V, split_out,
                             hp.n_head, hp.n_head_kv, kv_cap[(size_t) il], hp.n_swa, pos_d, block_n, kq_scale, split_full);
+#endif
                         dspark_detail::k_dspark_split_combine<<<dim3((unsigned) hp.n_head, (unsigned) block_n), 128, 0, E.st>>>(
                             split_out, att, hp.n_head, pos_d, split_full, 0, hp.n_swa, E.xq);
+                        dspark_att_xq = E.xq;
                     } else {
+#if defined(__HIP_PLATFORM_AMD__)
+                        dspark_detail::k_dspark_attn_q8<<<dim3((unsigned) hp.n_head, (unsigned) block_n), 128, 0, E.st>>>(
+                            Q, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], K, V, att,
+                            hp.n_head, hp.n_head_kv, kv_cap[(size_t) il], 1, hp.n_swa, pos_d, block_n, kq_scale);
+#else
                         const int sp_swa = std::min(split_full, 10);
                         dspark_detail::k_dspark_attn_q8_wmma_split<true><<<dim3((unsigned) hp.n_head_kv, (unsigned) sp_swa), 128, 18432, E.st>>>(
                             Q, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], K, V, split_out,
                             hp.n_head, hp.n_head_kv, kv_cap[(size_t) il], hp.n_swa, pos_d, block_n, kq_scale, sp_swa);
                         dspark_detail::k_dspark_split_combine<<<dim3((unsigned) hp.n_head, (unsigned) block_n), 128, 0, E.st>>>(
                             split_out, att, hp.n_head, pos_d, sp_swa, 1, hp.n_swa, E.xq);
+                        dspark_att_xq = E.xq;
+#endif
                     }
-                    dspark_att_xq = E.xq;
                 } else {
                     dspark_detail::k_dspark_attn_q8<<<dim3((unsigned) hp.n_head, (unsigned) block_n), 128, 0, E.st>>>(
                         Q, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], K, V, att,

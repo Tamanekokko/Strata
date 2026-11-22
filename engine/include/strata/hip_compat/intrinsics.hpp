@@ -100,8 +100,15 @@ __device__ __forceinline__ int vcmpne4(int a, int b) {
 
 // CUDA's mask argument describes participating lanes. The current kernel set uses full
 // wave32 masks; reject future partial-mask use instead of silently dropping its semantics.
-__device__ __forceinline__ void require_full_wave_mask(uint32_t mask) {
-    if (mask != 0xffffffffu) __builtin_trap();
+__device__ __forceinline__ void require_full_wave_mask(uint32_t mask, int width = 32) {
+    if (width >= 32) {
+        if (mask != 0xffffffffu) __builtin_trap();
+    } else {
+        const unsigned lane = __lane_id();
+        const unsigned group_base = lane & ~static_cast<unsigned>(width - 1);
+        const uint32_t submask = ((1u << width) - 1u) << group_base;
+        if ((mask & submask) != submask) __builtin_trap();
+    }
 }
 
 // Older HIP has no __syncwarp. A wave barrier alone does not order memory.
@@ -117,25 +124,25 @@ __device__ __forceinline__ void syncwarp(uint32_t mask = 0xffffffffu) {
 
 template <typename T>
 __device__ __forceinline__ T shfl_xor_sync(uint32_t mask, T value, int lane_mask, int width = 32) {
-    require_full_wave_mask(mask);
+    require_full_wave_mask(mask, width);
     return __shfl_xor(value, lane_mask, width);
 }
 
 template <typename T>
 __device__ __forceinline__ T shfl_down_sync(uint32_t mask, T value, unsigned delta, int width = 32) {
-    require_full_wave_mask(mask);
+    require_full_wave_mask(mask, width);
     return __shfl_down(value, delta, width);
 }
 
 template <typename T>
 __device__ __forceinline__ T shfl_up_sync(uint32_t mask, T value, unsigned delta, int width = 32) {
-    require_full_wave_mask(mask);
+    require_full_wave_mask(mask, width);
     return __shfl_up(value, delta, width);
 }
 
 template <typename T>
 __device__ __forceinline__ T shfl_sync(uint32_t mask, T value, int source_lane, int width = 32) {
-    require_full_wave_mask(mask);
+    require_full_wave_mask(mask, width);
     return __shfl(value, source_lane, width);
 }
 

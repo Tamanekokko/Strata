@@ -737,6 +737,7 @@ struct Engine {
     int fa2_256_bulk_smem = 87040;
     bool can_fa2_192 = false;
     bool can_fa2_256 = false;
+    bool has_hip_wmma = false;
     bool bf16_x_f16 = false;
     int attn_split_t1_full = 160;
     int attn_split_t1_swa = 20;
@@ -1072,6 +1073,15 @@ struct Engine {
         int cur_dev = 0, cc_maj = 0, cc_min = 0, max_smem_optin = 49152;
         cudaGetDevice(&cur_dev);
         cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, cur_dev);
+#if defined(__HIP_PLATFORM_AMD__)
+        {
+            cudaDeviceProp prop{};
+            if (cudaGetDeviceProperties(&prop, cur_dev) == cudaSuccess) {
+                has_hip_wmma = (std::strncmp(prop.gcnArchName, "gfx11", 5) == 0 ||
+                                std::strncmp(prop.gcnArchName, "gfx12", 5) == 0);
+            }
+        }
+#endif
         cudaDeviceGetAttribute(&cc_maj, cudaDevAttrComputeCapabilityMajor, cur_dev);
         cudaDeviceGetAttribute(&cc_min, cudaDevAttrComputeCapabilityMinor, cur_dev);
         cudaDeviceGetAttribute(&max_smem_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, cur_dev);
@@ -1097,6 +1107,15 @@ struct Engine {
         attn_split_t1_full = std::clamp((sm_count * profile.t1_full_split_mult) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax);
         attn_split_t1_swa = std::clamp((sm_count * profile.t1_swa_split_mult) / std::max(1, (int) hp.n_head_kv), 8, 24);
         // Configure dynamic shared memory for WMMA kernels upfront (required before CUDA Graph capture).
+#if defined(__HIP_PLATFORM_AMD__)
+        (void) max_smem_optin;
+        can_fa2_192 = false;
+        can_fa2_256 = false;
+        (void) cudaFuncSetAttribute((const void*) k_attn_q8_gqa3_pp_wmma_gqa3, cudaFuncAttributeMaxDynamicSharedMemorySize, 49152);
+        (void) cudaFuncSetAttribute((const void*) k_attn_q8_gqa3_pp_wmma_t32, cudaFuncAttributeMaxDynamicSharedMemorySize, 49152);
+        (void) cudaFuncSetAttribute((const void*) k_attn_q8_gqa3_pp_wmma, cudaFuncAttributeMaxDynamicSharedMemorySize, 29184);
+        (void) cudaGetLastError();
+#else
         // Gate high-SMEM FA2 kernels on cudaDevAttrMaxSharedMemoryPerBlockOptin so Turing (sm_75, 64 KB cap) cleanly falls back to pp_wmma (29 KB).
         auto try_set_smem = [&](const void* fn, int bytes) -> bool {
             if (max_smem_optin < bytes) return false;
@@ -1119,6 +1138,7 @@ struct Engine {
         try_set_smem((const void*) k_attn_q8_gqa3_pp_wmma_gqa3, 49152);
         try_set_smem((const void*) k_attn_q8_gqa3_pp_wmma_t32, 49152);
         try_set_smem((const void*) k_attn_q8_gqa3_pp_wmma, 29184);
+#endif
 
         const int64_t max_ent = (int64_t) tmax * hp.n_expert_used;
         d_f32(&router_logits, (size_t) tmax * hp.n_expert);
@@ -2732,6 +2752,7 @@ struct Engine {
             if (kv_q8) {
                 if (hp.n_head == 3 * hp.n_head_kv && hp.head_dim == 128) {
                     const int sp_cap = std::max(1, attn_split_slots / std::max(1, T));
+#if !defined(__HIP_PLATFORM_AMD__)
                     if (is_swa && T == 4) {
                         const int sp = std::min(sp_cap, std::clamp((sm_count + (int) hp.n_head_kv - 1) / std::max(1, (int) hp.n_head_kv), 4, 16));
                         k_attn_q8_gqa3_verify4_swa_wmma_split<<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 23040, st>>>(
@@ -2741,6 +2762,9 @@ struct Engine {
                             attn_split, pGate, att, (int) hp.n_head, sp, pos0_d, 1, (int) hp.n_swa, xq);
                         att_xq_ready = xq;
                     } else if (is_swa && T >= 1 && T <= 8) {
+#else
+                    if (is_swa && T >= 1 && T <= 8) {
+#endif
                         k_attn_q8_gqa3_swa_1pass<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
                             pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink,
                             pGate, att, xq, (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext,
@@ -2748,9 +2772,15 @@ struct Engine {
                         att_xq_ready = xq;
                     } else if (T == 4 && !is_swa) {
                         const int sp = std::min(sp_cap, std::clamp((sm_count * 24) / std::max(1, (int) hp.n_head_kv), 40, kAttnSplitMax));
+#if defined(__HIP_PLATFORM_AMD__)
+                        k_attn_q8_gqa3_verify4_split<<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 0, st>>>(
+                            pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, attn_split,
+                            (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, pos0_d, kq_scale, sp);
+#else
                         k_attn_q8_gqa3_verify4_wmma_split<<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 23040, st>>>(
                             pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, attn_split,
                             (int) hp.n_head, (int) hp.n_head_kv, kv_cap[(size_t) il], (int) hp.n_rel_ext, pos0_d, kq_scale, sp);
+#endif
                         k_attn_split_combine<<<dim3((unsigned) hp.n_head, 4), 128, 0, st>>>(
                             attn_split, pGate, att, (int) hp.n_head, sp, pos0_d, 0, (int) hp.n_swa, xq);
                         att_xq_ready = xq;
@@ -2765,6 +2795,36 @@ struct Engine {
                         k_attn_split_combine<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
                             attn_split, pGate, att, (int) hp.n_head, sp, pos0_d, is_swa ? 1 : 0, (int) hp.n_swa, (T <= 8) ? xq : nullptr);
                         if (T <= 8) att_xq_ready = xq;
+#if defined(__HIP_PLATFORM_AMD__)
+                    } else {
+                        // AMD RDNA3/RDNA4 have 64 KiB LDS per workgroup; use 44-49 KiB WMMA prefill kernels on gfx11/gfx12
+                        // and fall back to k_attn_q8 on older non-WMMA GPUs.
+                        static const int hip_pp_mode = []() {
+                            const char* v = std::getenv("STRATA_INKLING2_HIP_PP_ATTN");
+                            if (!v || !*v || std::strcmp(v, "gqa3") == 0) return 0;
+                            if (std::strcmp(v, "t32") == 0) return 1;
+                            if (std::strcmp(v, "wmma") == 0) return 2;
+                            return 3;
+                        }();
+                        if (!has_hip_wmma || hip_pp_mode == 3) {
+                            k_attn_q8<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
+                                pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, pGate, att,
+                                (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il], is_swa ? 1 : 0, (int) hp.n_swa, pos0_d, kq_scale);
+                        } else if (hip_pp_mode == 0) {
+                            k_attn_q8_gqa3_pp_wmma_gqa3<<<dim3((unsigned) hp.n_head_kv, (unsigned) ((T + 15) / 16)), 256, 44224, st>>>(
+                                pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, pGate, att,
+                                (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il], is_swa ? 1 : 0, (int) hp.n_swa, pos0_d, kq_scale, T);
+                        } else if (hip_pp_mode == 1) {
+                            k_attn_q8_gqa3_pp_wmma_t32<<<dim3((unsigned) hp.n_head, (unsigned) ((T + 31) / 32)), 256, 48768, st>>>(
+                                pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, pGate, att,
+                                (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il], is_swa ? 1 : 0, (int) hp.n_swa, pos0_d, kq_scale, T);
+                        } else {
+                            k_attn_q8_gqa3_pp_wmma<<<dim3((unsigned) hp.n_head, (unsigned) ((T + 15) / 16)), 128, 29184, st>>>(
+                                pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, pGate, att,
+                                (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il], is_swa ? 1 : 0, (int) hp.n_swa, pos0_d, kq_scale, T);
+                        }
+                    }
+#else
                     } else if (can_fa2_256 && !is_swa && T >= 256 && pos >= 8192 &&
                                pp_sp_buf && pp_sp_bytes >= (size_t) T * (size_t) hp.n_head * 130 * sizeof(float) * 2) {
                         // Zero-sP, Zero-Spill 256-row FA2: pure bulk Split-KV [0, bulk_aligned) + 1 tail split [bulk_aligned, pos+T).
@@ -2837,6 +2897,7 @@ struct Engine {
                             pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, pGate, att,
                             (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il], is_swa ? 1 : 0, (int) hp.n_swa, pos0_d, kq_scale, T);
                     }
+#endif
                 } else {
                     k_attn_q8<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
                         pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, pGate, att,
@@ -3074,7 +3135,12 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
     size_t fr = 0, tot = 0;
     CK(cudaMemGetInfo(&fr, &tot));
     const bool core_res_hy = (E.profile.regime == strata::inkling2::VramRegime::CoreResidentHybrid);
+#if defined(__HIP_PLATFORM_AMD__)
+    // Reserve extra headroom for rocBLAS/hipBLASLt TensileLibrary loading and GEMM workspace.
+    const size_t reserve = (size_t) 512 << 20;
+#else
     const size_t reserve = core_res_hy ? ((size_t) 144 << 20) : ((size_t) 256 << 20);
+#endif
     size_t budget = vram_gib >= 0.0 ? (size_t) (vram_gib * (double) (1ull << 30))
                                     : (fr > reserve ? fr - reserve : 0);
 
@@ -3677,6 +3743,9 @@ int run(int argc, char** argv) {
         pin.cc_major = strata::cc_major_of(raw_maj);
         pin.cc_minor = strata::cc_minor_of(raw_min);
         pin.sm_count = sm_cnt;
+#if defined(__HIP_PLATFORM_AMD__)
+        pin.is_hip = true;
+#endif
         pin.vram_total_bytes = vtot;
         pin.vram_free_bytes = vfree;
         pin.max_ctx = max_ctx;

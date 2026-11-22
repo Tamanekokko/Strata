@@ -21,6 +21,9 @@ enum class ArchId {
     Generic = 0,
     Sm70Volta,   // Tesla V100 (sm_70): measured R5 (819K Q8KV, DSpark ON)
     Sm89Ada,     // RTX 4070 (sm_89): measured R4 (65K/131K/262K Q8KV, DSpark OFF)
+    HipRdna4,    // AMD RDNA4 (gfx1200/gfx1201, e.g. RX 9060 XT / RX 9070 XT)
+    HipRdna3,    // AMD RDNA3 (gfx11xx, e.g. RX 7900 XTX / RX 7800 XT)
+    HipGeneric,  // Other AMD ROCm/HIP GPUs
 };
 
 struct ArchProfile {
@@ -40,7 +43,61 @@ struct ArchProfile {
     bool allow_core_chunk_2048 = false;   // Measured win on sm_89 12GB CoreResidentHybrid when tier1 still fits 128/128
 };
 
-inline ArchProfile select_arch_profile(int cc_major, int cc_minor) {
+inline ArchProfile select_arch_profile(int cc_major, int cc_minor, bool is_hip = false) {
+    if (is_hip) {
+        if (cc_major == 12) {
+            ArchProfile p;
+            p.id = ArchId::HipRdna4;
+            p.name = "rdna4";
+            p.force_bf16_x_f16 = false;
+            p.full_vram_want_sp = 5;
+            p.hybrid_want_sp_1024 = 4;
+            p.hybrid_want_sp_2048 = 4;
+            p.t1_full_split_mult = 8;
+            p.t1_swa_split_mult = 2;
+            p.pp_stage_mb = 64;
+            p.pp_stage_cnt_pref = 3;
+            p.pp_stage_cnt_core = 2;
+            p.kv_grow_reserve_mib = 384;
+            p.allow_tight_chunk_2048 = false;
+            p.allow_core_chunk_2048 = false;
+            return p;
+        }
+        if (cc_major == 11) {
+            ArchProfile p;
+            p.id = ArchId::HipRdna3;
+            p.name = "rdna3";
+            p.force_bf16_x_f16 = false;
+            p.full_vram_want_sp = 5;
+            p.hybrid_want_sp_1024 = 4;
+            p.hybrid_want_sp_2048 = 4;
+            p.t1_full_split_mult = 8;
+            p.t1_swa_split_mult = 2;
+            p.pp_stage_mb = 64;
+            p.pp_stage_cnt_pref = 3;
+            p.pp_stage_cnt_core = 2;
+            p.kv_grow_reserve_mib = 384;
+            p.allow_tight_chunk_2048 = false;
+            p.allow_core_chunk_2048 = false;
+            return p;
+        }
+        ArchProfile p;
+        p.id = ArchId::HipGeneric;
+        p.name = "hip_generic";
+        p.force_bf16_x_f16 = false;
+        p.full_vram_want_sp = 4;
+        p.hybrid_want_sp_1024 = 4;
+        p.hybrid_want_sp_2048 = 4;
+        p.t1_full_split_mult = 8;
+        p.t1_swa_split_mult = 2;
+        p.pp_stage_mb = 64;
+        p.pp_stage_cnt_pref = 3;
+        p.pp_stage_cnt_core = 2;
+        p.kv_grow_reserve_mib = 384;
+        p.allow_tight_chunk_2048 = false;
+        p.allow_core_chunk_2048 = false;
+        return p;
+    }
     if (cc_major == 7 && cc_minor == 0) {
         ArchProfile p;
         p.id = ArchId::Sm70Volta;
@@ -110,6 +167,7 @@ struct ProfileInput {
     int cc_major = 0;
     int cc_minor = 0;
     int sm_count = 0;
+    bool is_hip = false;
     size_t vram_total_bytes = 0;
     size_t vram_free_bytes = 0;       // Free VRAM after dense model (and optional draft weights) load
     int max_ctx = 65536;
@@ -143,7 +201,7 @@ struct ResolvedProfile {
 
 inline ResolvedProfile resolve_inkling2_profile(const ProfileInput& in) {
     ResolvedProfile out;
-    out.arch = select_arch_profile(in.cc_major, in.cc_minor);
+    out.arch = select_arch_profile(in.cc_major, in.cc_minor, in.is_hip);
     out.force_bf16_x_f16 = out.arch.force_bf16_x_f16;
     out.kv_grow_reserve_mib = out.arch.kv_grow_reserve_mib;
     out.t1_full_split_mult = out.arch.t1_full_split_mult;

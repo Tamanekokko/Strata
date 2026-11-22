@@ -3,7 +3,7 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
+#if (!defined(__HIP_PLATFORM_AMD__) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700)) || (defined(__HIP_PLATFORM_AMD__) && (!defined(__HIP_DEVICE_COMPILE__) || defined(__GFX11__) || defined(__GFX12__) || defined(__gfx1200__) || defined(__gfx1201__)))
 #include <mma.h>
 #endif
 #include <cstdint>
@@ -2248,7 +2248,7 @@ __global__ void __launch_bounds__(128, 3) k_attn_q8_gqa3_pp_wmma(
         const float* __restrict__ gate, float* __restrict__ out,
         int n_head, int n_head_kv, int n_ext, int cap, int is_swa, int n_swa,
         const int32_t* __restrict__ pos0, float kq_scale, int T) {
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
+#if (!defined(__HIP_PLATFORM_AMD__) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700)) || (defined(__HIP_PLATFORM_AMD__) && (!defined(__HIP_DEVICE_COMPILE__) || defined(__GFX11__) || defined(__GFX12__) || defined(__gfx1200__) || defined(__gfx1201__)))
     using namespace nvcuda;
     extern __shared__ char smem_raw[];
     // Align each region to 16 bytes:
@@ -2529,7 +2529,7 @@ __global__ void __launch_bounds__(256, 2) k_attn_q8_gqa3_pp_wmma_t32(
         const float* __restrict__ gate, float* __restrict__ out,
         int n_head, int n_head_kv, int n_ext, int cap, int is_swa, int n_swa,
         const int32_t* __restrict__ pos0, float kq_scale, int T) {
-#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
+#if (!defined(__HIP_PLATFORM_AMD__) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700)) || (defined(__HIP_PLATFORM_AMD__) && (!defined(__HIP_DEVICE_COMPILE__) || defined(__GFX11__) || defined(__GFX12__) || defined(__gfx1200__) || defined(__gfx1201__)))
     using namespace nvcuda;
     extern __shared__ __align__(16) char smem_raw[];
     // 48,768 B total (fits 2 blk/SM in 96/100 KB): sQ (8704) | sKV (17408, separate!) | sP (4608) |
@@ -3115,9 +3115,13 @@ __global__ void __launch_bounds__(256, 2) k_attn_q8_gqa3_pp_wmma_gqa3(
 
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
 __device__ __forceinline__ float fast_exp2f_hw(float x) {
+#if defined(__HIP_PLATFORM_AMD__)
+    return exp2f(x);
+#else
     float y;
     asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
     return y;
+#endif
 }
 
 __device__ __forceinline__ void i8x4_to_h2x2_fma(uint32_t packed_i8x4, __half2 sc2, __half2 neg_bias_sc2,
@@ -3134,6 +3138,7 @@ __device__ __forceinline__ void i8x4_to_h2x2_scaled(uint32_t packed_i8x4, __half
     i8x4_to_h2x2_fma(packed_i8x4, scale2, __hmul2(neg1152, scale2), out0, out1);
 }
 
+#if !defined(__HIP_PLATFORM_AMD__)
 __device__ __forceinline__ void wmma_acc_layout_16x16(int lane, int& r0, int& r1, int& c0, int& c1) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
     r0 = ((lane & 16) >> 2) + ((lane & 4) << 1) + (lane & 1);
@@ -3233,8 +3238,10 @@ __device__ __forceinline__ void wmma_acc_to_matA_16x16(
     fa_u[3] = fa_u[7] = b1;
 #endif
 }
+#endif  // !__HIP_PLATFORM_AMD__
 #endif
 
+#if !defined(__HIP_PLATFORM_AMD__)
 /// FlashAttention-2 192-row (64 tokens x 3 GQA heads, 256 threads = 8 warps, 1 blk/SM, 97,280 B SMEM) FP16 WMMA prefill:
 /// 8-warp (4 row-groups x 2 col-groups, exact 2 warps/SMSP, 0 register spills): 3x2 Q*K^T -> bar.sync 64-thr half-row max
 /// merge -> sP -> 3x4 register-resident P*V (0.583 SMEM loads/WMMA), HFMA2 KV dequant, shifted-nsink bulk loop, lazy acc rescale.
@@ -4558,6 +4565,7 @@ __global__ void __launch_bounds__(256, 1) k_attn_q8_gqa3_pp_fa2_256_tail(
     }
 #endif
 }
+#endif  // !__HIP_PLATFORM_AMD__
 
 /// Combine Split-KV prefill FA2 outputs (log2-base m/l) and apply optional sigmoid gate. grid (n_head, T), block 128.
 __global__ void k_attn_pp_split_combine(const float* __restrict__ split_out, const float* __restrict__ gate,
@@ -5094,6 +5102,7 @@ __global__ void __launch_bounds__(128, 6) k_attn_q8_gqa3_verify4_split(
 /// 4 warps (128 thr, 4 blk/SM, 21,760 B SMEM, 128 regs, 0 spills): each warp owns a private 16x136 sKV slice and steps
 /// independently with ZERO __syncthreads() inside the entire 800K KV loop, ZERO sS/sP SMEM via wmma_acc_to_matA_16x16,
 /// V prefetch overlapping QK^T, shifted-nsink bulk loop, lazy acc rescale, and single 4-warp epilogue combine.
+#if !defined(__HIP_PLATFORM_AMD__)
 __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_wmma_split(
         const float* __restrict__ Q,
         const int8_t* __restrict__ kq, const __half* __restrict__ ks,
@@ -6414,6 +6423,7 @@ __global__ void __launch_bounds__(128, 4) k_attn_q8_gqa3_verify4_swa_wmma_split(
     }
 #endif
 }
+#endif  // !__HIP_PLATFORM_AMD__
 
 /// Combine Split-KV partials across active splits and apply fused sigmoid gate (+ optional direct Q8_1 store): grid (n_head, T), block 128.
 __global__ void k_attn_split_combine(const float* __restrict__ split_out, const float* __restrict__ gate,
