@@ -88,7 +88,8 @@ void iq_xmx_grouped(int ty, const uint8_t* const* a, const uint8_t* const* b, co
 /// not have.  The results do not depend on it.
 bool native_expert_nvfp4_t1_fused(const NativeExpertLayout& L, const uint8_t* blobs, size_t stride,
                                   const int32_t* ids, const float* ewts, int kp,
-                                  const void* x_q8_1, void* scratch, float* out_sum, void* stream);
+                                  const void* x_q8_1, void* scratch, float* out_sum, void* stream,
+                                  uint32_t* done_cnt = nullptr, uint32_t* peer_flag = nullptr, uint32_t peer_step = 0);
 
 void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,

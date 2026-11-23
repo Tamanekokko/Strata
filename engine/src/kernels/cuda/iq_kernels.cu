@@ -6994,17 +6994,61 @@ __global__ void __launch_bounds__(128, 8) native_down_nvfp4_18_combine_t1_kernel
     if (t == 0) out_sum[r] = acc;
 }
 
+__global__ void __launch_bounds__(128, 4) native_down_nvfp4_36_combine_t1_kernel(
+    const uint8_t* __restrict__ blobs, size_t stride, const int32_t* __restrict__ ids,
+    const float* __restrict__ ewts, int kp,
+    const block_q8_1* __restrict__ hq, NativeExpertLayout L, float* __restrict__ out_sum) {
+    __shared__ uint32_t s_hq_buf[8 * 36 * 9];
+    __shared__ float s_ue4m3[256];
+    __shared__ int32_t s_ids[8];
+    __shared__ float s_ewts[8];
+    s_ue4m3[threadIdx.x] = ue4m3_to_f32_half((uint8_t) threadIdx.x);
+    s_ue4m3[threadIdx.x + 128] = ue4m3_to_f32_half((uint8_t) (threadIdx.x + 128));
+    if (threadIdx.x < kp) {
+        s_ids[threadIdx.x] = ids[threadIdx.x];
+        s_ewts[threadIdx.x] = ewts[threadIdx.x];
+    }
+    const int words = kp * (36 * 9);
+    const uint32_t* src = reinterpret_cast<const uint32_t*>(hq);
+    for (int i = threadIdx.x; i < words; i += 128) s_hq_buf[i] = src[i];
+    iq_sync_lds();
+
+    const int r = blockIdx.x * 16 + (threadIdx.x >> 3);
+    const int t = threadIdx.x & 7;
+    if (r >= L.n_embd) return;
+    const size_t w_off = L.down_off + (size_t) r * L.d_row;
+    const block_q8_1* s_hq = reinterpret_cast<const block_q8_1*>(s_hq_buf);
+
+    float acc = 0.0f;
+    for (int k = 0; k < kp; ++k) {
+        const uint8_t* blob = blobs + (size_t) s_ids[k] * stride;
+        const float sd = L.tail_off ? ((const float*) (blob + L.tail_off))[2] : 1.0f;
+        const int off1[1] = { k * 36 };
+        float s1[1];
+        row_dot_36_sub8<1, true>(blob + w_off, s_hq, off1, 1, t, s1, s_ue4m3);
+        if (t == 0) acc += (s1[0] * sd) * s_ewts[k];
+    }
+    if (t == 0) out_sum[r] = acc;
+}
+
 bool native_expert_nvfp4_t1_fused(const NativeExpertLayout& L, const uint8_t* blobs, size_t stride,
                                   const int32_t* ids, const float* ewts, int kp,
-                                  const void* x_q8_1, void* scratch, float* out_sum, void* stream) {
-    if (L.gu_type != 40 || L.d_type != 40 || L.n_embd != 2304 || L.n_ff != 576 || !L.situ ||
+                                  const void* x_q8_1, void* scratch, float* out_sum, void* stream,
+                                  uint32_t* done_cnt, uint32_t* peer_flag, uint32_t peer_step) {
+    if (L.gu_type != 40 || L.d_type != 40 || L.n_embd != 2304 || (L.n_ff != 576 && L.n_ff != 1152) || !L.situ ||
         L.had_block != 0 || kp <= 0 || kp > 8) return false;
     cudaStream_t s = (cudaStream_t) stream;
     block_q8_1* hq = (block_q8_1*) scratch;
-    native_gu_nvfp4_72_situ_q8_1_t1_kernel<<<dim3(18, (unsigned) kp), 256, 0, s>>>(
+    native_gu_nvfp4_72_situ_q8_1_t1_kernel<<<dim3((unsigned) (L.n_ff / 32), (unsigned) kp), 256, 0, s>>>(
         blobs, stride, ids, (const block_q8_1*) x_q8_1, L, L.situ_beta, L.situ_linear_beta, hq);
-    native_down_nvfp4_18_combine_t1_kernel<<<dim3(144, 1), 128, 0, s>>>(
-        blobs, stride, ids, ewts, kp, hq, L, out_sum);
+    (void) done_cnt; (void) peer_flag; (void) peer_step;
+    if (L.n_ff == 576) {
+        native_down_nvfp4_18_combine_t1_kernel<<<dim3(144, 1), 128, 0, s>>>(
+            blobs, stride, ids, ewts, kp, hq, L, out_sum);
+    } else {
+        native_down_nvfp4_36_combine_t1_kernel<<<dim3(144, 1), 128, 0, s>>>(
+            blobs, stride, ids, ewts, kp, hq, L, out_sum);
+    }
     return true;
 }
 

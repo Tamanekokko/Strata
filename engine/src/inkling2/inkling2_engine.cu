@@ -1145,6 +1145,7 @@ struct Engine {
     int attn_split_t1_full = 160;
     int attn_split_t1_swa = 20;
     float *router_logits = nullptr, *ewts = nullptr, *eparts = nullptr, *moe_raw = nullptr;
+    uint32_t* router_done_d = nullptr;
     size_t eparts_bytes = 0;
     float *logits = nullptr;
     float* h_tok_buf = nullptr;      // pinned [tmax * N] FP32 for token embedding upload
@@ -1541,6 +1542,7 @@ struct Engine {
         float* fg_head_val = nullptr;         // on primary_dev
         int32_t* fg_head_idx = nullptr;       // on primary_dev
         uint32_t* fg_flag1 = nullptr;         // on peer dev (GPU0 pushes, GPU1 spins)
+        uint32_t* fg_done1 = nullptr;         // on peer dev (block completion counter)
         float* fg_in_q = nullptr;             // on peer dev
         float* fg_in_k = nullptr;             // on peer dev
         float* fg_in_v = nullptr;             // on peer dev
@@ -1616,6 +1618,7 @@ struct Engine {
                 if (ev_attn_done) cudaEventDestroy(ev_attn_done);
                 if (tp_graph1) cudaGraphExecDestroy(tp_graph1);
                 if (fg_flag1) cudaFree(fg_flag1);
+                if (fg_done1) cudaFree(fg_done1);
                 if (fg_in_q) cudaFree(fg_in_q);
                 if (fg_in_k) cudaFree(fg_in_k);
                 if (fg_in_v) cudaFree(fg_in_v);
@@ -1792,6 +1795,8 @@ struct Engine {
                 CK(hipExtMallocWithFlags((void**) &fg_ids, (size_t) hp.n_expert_used * sizeof(int32_t), hipDeviceMallocFinegrained));
                 CK(hipExtMallocWithFlags((void**) &fg_ewts, (size_t) hp.n_expert_used * sizeof(float), hipDeviceMallocFinegrained));
                 CK(hipMemset(fg_flag1, 0, sizeof(uint32_t)));
+                CK(hipMalloc((void**) &fg_done1, sizeof(uint32_t)));
+                CK(hipMemset(fg_done1, 0, sizeof(uint32_t)));
                 fg_ready = true;
             }
 #endif
@@ -1908,7 +1913,7 @@ struct Engine {
         cudaFree(qgr_t1);
         cudaFree(sink);
         cudaFree(attn_split);
-        cudaFree(router_logits); cudaFree(ewts);
+        cudaFree(router_logits); cudaFree(router_done_d); cudaFree(ewts);
         cudaFree(logits); cudaFree(act_bf16); cudaFree(act_bf16_only);
         cudaFree(xq); cudaFree(xq_k); cudaFree(xq_v);
         cudaFree(layer_arena);
@@ -2096,6 +2101,8 @@ struct Engine {
 
         const int64_t max_ent = (int64_t) tmax * hp.n_expert_used;
         d_f32(&router_logits, (size_t) tmax * hp.n_expert);
+        CK(cudaMalloc(&router_done_d, sizeof(uint32_t)));
+        CK(cudaMemset(router_done_d, 0, sizeof(uint32_t)));
         d_f32(&ewts, (size_t) max_ent);
         d_f32(&logits, (size_t) verify_max_t * hp.vocab_unpadded);
 
@@ -2562,6 +2569,27 @@ struct Engine {
         CKB(cublasSgemm(blas, CUBLAS_OP_T, CUBLAS_OP_N, (int) N_out, T, (int) K_in, &alpha, W, (int) K_in, X, (int) K_in, &beta, Y, (int) N_out));
     }
 
+#if defined(__HIP_PLATFORM_AMD__)
+    bool run_mix_rms_norm_q8_1_t1(const std::vector<float*>& n_blocks, const float* c, bool c_already_normed,
+                                  const float* query, float* y_out, const float* norm_w, void* xq_out,
+                                  float* peer_y = nullptr, void* peer_xq = nullptr,
+                                  uint32_t* peer_flag = nullptr, uint32_t peer_step = 0) {
+        const auto& hp = m->hp;
+        const int N = (int) hp.n_embd;
+        const int B = (int) n_blocks.size();
+        const int D = B + 1;
+        if (N != 2304 || D > 8) return false;
+        NormMixPtrs np{};
+        for (int i = 0; i < B; ++i) np.p[i] = n_blocks[(size_t) (B - 1 - i)];
+        np.p[B] = c;
+        const float inv_sqrt_n = 1.0f / std::sqrt((float) N);
+        k_mix_rms_norm_q8_1_t1<<<1, 576, 0, st>>>(
+            np, D, query, y_out, norm_w, xq_out, inv_sqrt_n, c_already_normed ? 0 : 1, hp.rms_eps,
+            peer_y, peer_xq, peer_flag, peer_step);
+        return true;
+    }
+#endif
+
     void run_mix_normed(const std::vector<float*>& n_blocks, const float* c, bool c_already_normed, const float* query, float* const* outs, int n_q, int T, int swa_bcast) {
         const auto& hp = m->hp;
         const int N = (int) hp.n_embd;
@@ -2614,11 +2642,19 @@ struct Engine {
         }
         if (T == 1 && L.loop_down[mod].type == 1 && L.loop_gain[mod].type == 1 && L.loop_forget[mod].type == 1 &&
             hp.loop_gate_rank == 64 && (N & 3) == 0) {
+#if defined(__HIP_PLATFORM_AMD__)
+            k_loop_down_fused_f16_t1_rdna4<<<32, 192, 0, st>>>(
+                (const uint16_t*) L.loop_down[mod].d, c, msg, ctrl64, N, 64, hp.rms_eps);
+            k_control_up_combine_f16_t1_rdna4<<<(unsigned) ((N + 15) / 16), 128, 0, st>>>(
+                c, msg, (const uint16_t*) L.loop_gain[mod].d, (const uint16_t*) L.loop_forget[mod].d,
+                ctrl64, out, N);
+#else
             k_loop_down_fused_f16_t1<<<64, 256, 0, st>>>(
                 (const uint16_t*) L.loop_down[mod].d, c, msg, ctrl64, N, 64, hp.rms_eps);
             k_control_up_combine_f16_t1<<<(unsigned) ((N + 31) / 32), 256, 0, st>>>(
                 c, msg, (const uint16_t*) L.loop_gain[mod].d, (const uint16_t*) L.loop_forget[mod].d,
                 ctrl64, out, 64, N);
+#endif
             return;
         }
         if (T >= 32 && (N & 3) == 0 && ctrl_w16 && L.loop_down[mod].type == 0 && L.loop_gain[mod].type == 0 && L.loop_forget[mod].type == 0) {
@@ -2786,8 +2822,16 @@ struct Engine {
         const bool has_peer = (L.peer_slots > 0 && peer.dev >= 0);
         const bool need_cpu = L.tp_moe ? (L.n_slots < hp.n_expert || L.peer_slots < hp.n_expert) : ((L.n_slots + L.peer_slots) < hp.n_expert);
         const bool is_q5 = (L.L.gu_type == 13);
-        const bool fused_rg = (!need_cpu && !has_peer && has_gpu && !pre_routed_t1 && T >= 1 && T <= 8 &&
-                               hp.n_expert <= 128 && Kp <= 16);
+#if defined(__HIP_PLATFORM_AMD__)
+        const bool fused_t1_1gpu = (!need_cpu && !has_peer && has_gpu && !pre_routed_t1 && T == 1 && !skip_combine &&
+                                    L.n_slots == hp.n_expert && L.L.gu_type == 40 && L.L.d_type == 40 &&
+                                    L.L.n_embd == 2304 && L.L.n_ff == 1152 && L.L.situ && L.L.had_block == 0 &&
+                                    Kp > 0 && Kp <= 8);
+#else
+        const bool fused_t1_1gpu = false;
+#endif
+        const bool fused_rg = (!need_cpu && !has_peer && has_gpu && !pre_routed_t1 && !fused_t1_1gpu &&
+                               T >= 1 && T <= 8 && hp.n_expert <= 128 && Kp <= 16);
 
         const auto tp_moe_r0 = Clock::now();
         if (!pre_routed_t1) {
@@ -2796,23 +2840,42 @@ struct Engine {
             } else if (has_peer && !need_cpu && !peer.p2p && T == 1 && !xq_ready_in) {
                 CK(cudaMemcpyAsync(peer.h_x, x_norm, (size_t) N * sizeof(float), cudaMemcpyDeviceToHost, st));
             }
-            project_f32(x_norm, L.ffn_gate_inp, router_logits, T, hp.n_expert, N);
-            if (fused_rg) {
-                const int blk = (T <= 4) ? 128 : 256;
-                k_route_and_group_smallT<<<1, blk, 0, st>>>(
-                    router_logits, L.exp_probs_b, ids, ewts, L.d_slot_of, L.d_blobs, L.stride,
-                    T, (int) hp.n_expert, Kp, hp.expert_weights_scale,
-                    grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
-                    (profile.use_d_hits || hybrid || full_kv_cap < ctx) ? L.d_hits : nullptr);
-            } else {
-                const bool route_p2p = (use_p2p_spin && T == 1 && peer.fg_ready && xq_ready_in && N == 2304);
-                k_route_inkling2<<<(unsigned) T, 32, 0, st>>>(
-                    router_logits, L.exp_probs_b, ids, ewts, (int) hp.n_expert, Kp, hp.expert_weights_scale,
+#if defined(__HIP_PLATFORM_AMD__)
+            const bool fused_gemv_route = (!fused_rg && T == 1 && hp.n_expert == 128 && N == 2304 && Kp <= 16);
+#else
+            const bool fused_gemv_route = false;
+#endif
+            if (fused_gemv_route) {
+#if defined(__HIP_PLATFORM_AMD__)
+                const bool route_p2p = (use_p2p_spin && peer.fg_ready && xq_ready_in);
+                k_gemv_route_inkling2_t1<<<16, 256, 0, st>>>(
+                    L.ffn_gate_inp, x_norm, router_logits, L.exp_probs_b, ids, ewts,
+                    router_done_d, Kp, hp.expert_weights_scale,
                     (profile.use_d_hits || hybrid || full_kv_cap < ctx) ? L.d_hits : nullptr,
                     route_p2p ? peer.fg_ids : nullptr,
                     route_p2p ? peer.fg_ewts : nullptr,
                     route_p2p ? peer.fg_flag1 : nullptr,
                     route_p2p ? (uint32_t) (il * 2 + 2) : 0u);
+#endif
+            } else {
+                project_f32(x_norm, L.ffn_gate_inp, router_logits, T, hp.n_expert, N);
+                if (fused_rg) {
+                    const int blk = (T <= 4) ? 128 : 256;
+                    k_route_and_group_smallT<<<1, blk, 0, st>>>(
+                        router_logits, L.exp_probs_b, ids, ewts, L.d_slot_of, L.d_blobs, L.stride,
+                        T, (int) hp.n_expert, Kp, hp.expert_weights_scale,
+                        grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
+                        (profile.use_d_hits || hybrid || full_kv_cap < ctx) ? L.d_hits : nullptr);
+                } else {
+                    const bool route_p2p = (use_p2p_spin && T == 1 && peer.fg_ready && xq_ready_in && N == 2304);
+                    k_route_inkling2<<<(unsigned) T, 32, 0, st>>>(
+                        router_logits, L.exp_probs_b, ids, ewts, (int) hp.n_expert, Kp, hp.expert_weights_scale,
+                        (profile.use_d_hits || hybrid || full_kv_cap < ctx) ? L.d_hits : nullptr,
+                        route_p2p ? peer.fg_ids : nullptr,
+                        route_p2p ? peer.fg_ewts : nullptr,
+                        route_p2p ? peer.fg_flag1 : nullptr,
+                        route_p2p ? (uint32_t) (il * 2 + 2) : 0u);
+                }
             }
             if (prof_detail) { CK(cudaStreamSynchronize(st)); p_d_route += ms_since(tp_moe_r0); }
         }
@@ -3042,6 +3105,14 @@ struct Engine {
         }
 
         const auto tp_mg0 = Clock::now();
+        if (fused_t1_1gpu) {
+            ensure_q8();
+            if (K::native_expert_nvfp4_t1_fused(L.L, L.d_blobs, L.stride, ids, ewts, Kp, xq, escr, moe_raw, st)) {
+                if (prof_detail) { CK(cudaStreamSynchronize(st)); p_d_moe_gpu_core += ms_since(tp_mg0); }
+                hy_gpu += n_ent;
+                return;
+            }
+        }
         if (has_gpu) {
             if (!fused_rg) {
                 k_group_experts<<<1, 128, 0, st>>>(ids, L.d_slot_of, L.d_blobs, L.stride, n_ent, (int) hp.n_expert, L.n_slots,
@@ -3767,18 +3838,62 @@ struct Engine {
             bool q8_pre_done = false;
             bool swa_p2p_pushed = false;
             if (L.attn_res_query) {
+#if defined(__HIP_PLATFORM_AMD__)
+                const bool push_swa_p2p_m = (use_p2p_spin && N == 2304);
+                if (!has_msg && is_swa && T == 1 && fuse_q8_norm &&
+                    run_mix_rms_norm_q8_1_t1(norm_blocks, cur, false, L.attn_res_query, in_q, L.attn_norm, xq,
+                                             push_swa_p2p_m ? peer.fg_in_q : nullptr,
+                                             push_swa_p2p_m ? peer.fg_xq_q : nullptr,
+                                             push_swa_p2p_m ? peer.fg_flag1 : nullptr,
+                                             push_swa_p2p_m ? (uint32_t) (il * 2 + 1) : 0u)) {
+                    q8_pre_done = true;
+                    swa_p2p_pushed = push_swa_p2p_m;
+                    ink_src = in_q;
+                    inv_src = in_q;
+                } else
+#endif
+                {
                 float* outs[3] = {in_q, in_k, in_v};
                 run_mix_normed(norm_blocks, cur, false, L.attn_res_query, outs, is_swa ? 1 : 3, T, is_swa ? 1 : 0);
                 if (has_msg) {
-                    run_control(in_q, msg0, L, 0, in_q, T);
-                    run_control(in_k, msg1, L, 1, in_k, T);
-                    run_control(in_v, msg2, L, 2, in_v, T);
+#if defined(__HIP_PLATFORM_AMD__)
+                    if (T == 1 && hp.loop_gate_rank == 64 && (N & 3) == 0 &&
+                        L.loop_down[0].type == 1 && L.loop_down[1].type == 1 && L.loop_down[2].type == 1 &&
+                        L.loop_gain[0].type == 1 && L.loop_gain[1].type == 1 && L.loop_gain[2].type == 1 &&
+                        L.loop_forget[0].type == 1 && L.loop_forget[1].type == 1 && L.loop_forget[2].type == 1) {
+                        k_loop_down_fused_f16_3way_t1_rdna4<<<dim3(32, 3), 192, 0, st>>>(
+                            (const uint16_t*) L.loop_down[0].d, (const uint16_t*) L.loop_down[1].d, (const uint16_t*) L.loop_down[2].d,
+                            in_q, in_k, in_v, msg0, msg1, msg2, ctrl64, N, 64, hp.rms_eps);
+                        k_control_up_combine_f16_3way_t1_rdna4<<<dim3((unsigned) ((N + 15) / 16), 3), 128, 0, st>>>(
+                            in_q, in_k, in_v, msg0, msg1, msg2,
+                            (const uint16_t*) L.loop_gain[0].d, (const uint16_t*) L.loop_gain[1].d, (const uint16_t*) L.loop_gain[2].d,
+                            (const uint16_t*) L.loop_forget[0].d, (const uint16_t*) L.loop_forget[1].d, (const uint16_t*) L.loop_forget[2].d,
+                            ctrl64, in_q, in_k, in_v, N);
+                    } else
+#endif
+                    {
+                        run_control(in_q, msg0, L, 0, in_q, T);
+                        run_control(in_k, msg1, L, 1, in_k, T);
+                        run_control(in_v, msg2, L, 2, in_v, T);
+                    }
                 }
                 if (is_swa && has_msg) {
                     if (fuse_q8_norm) {
                         k_rms_norm_3_q8_1<<<dim3(3, (unsigned) T), rms_q8_blk, 0, st>>>(
                             in_q, in_k, in_v, in_q, in_k, in_v, L.attn_norm, L.attn_norm, L.attn_norm,
-                            xq, xq_k, xq_v, N, hp.rms_eps);
+                            xq, xq_k, xq_v, N, hp.rms_eps,
+                            (use_p2p_spin && N == 2304) ? peer.fg_in_q : nullptr,
+                            (use_p2p_spin && N == 2304) ? peer.fg_in_k : nullptr,
+                            (use_p2p_spin && N == 2304) ? peer.fg_in_v : nullptr,
+                            (use_p2p_spin && N == 2304) ? peer.fg_xq_q : nullptr,
+                            (use_p2p_spin && N == 2304) ? peer.fg_xq_k : nullptr,
+                            (use_p2p_spin && N == 2304) ? peer.fg_xq_v : nullptr,
+                            (use_p2p_spin && N == 2304) ? router_done_d : nullptr,
+                            (use_p2p_spin && N == 2304) ? peer.fg_flag1 : nullptr,
+                            (use_p2p_spin && N == 2304) ? (uint32_t) (il * 2 + 1) : 0u);
+                        if (use_p2p_spin && N == 2304) {
+                            swa_p2p_pushed = true;
+                        }
                         q8_pre_done = true;
                     } else if (T > 8) {
                         k_rms_norm_3_f16<<<dim3(3, (unsigned) T), kThreads, 0, st>>>(
@@ -3815,12 +3930,12 @@ struct Engine {
                             (use_p2p_spin && N == 2304) ? peer.fg_in_v : nullptr,
                             (use_p2p_spin && N == 2304) ? peer.fg_xq_q : nullptr,
                             (use_p2p_spin && N == 2304) ? peer.fg_xq_k : nullptr,
-                            (use_p2p_spin && N == 2304) ? peer.fg_xq_v : nullptr);
+                            (use_p2p_spin && N == 2304) ? peer.fg_xq_v : nullptr,
+                            (use_p2p_spin && N == 2304) ? router_done_d : nullptr,
+                            (use_p2p_spin && N == 2304) ? peer.fg_flag1 : nullptr,
+                            (use_p2p_spin && N == 2304) ? (uint32_t) (il * 2 + 1) : 0u);
                         if (use_p2p_spin && N == 2304) {
-#if defined(__HIP_PLATFORM_AMD__)
-                            k_p2p_signal<<<1, 1, 0, st>>>(peer.fg_flag1, (uint32_t) (il * 2 + 1));
                             swa_p2p_pushed = true;
-#endif
                         }
                         q8_pre_done = true;
                     } else if (T > 8) {
@@ -3833,11 +3948,22 @@ struct Engine {
                         k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_v, L.attn_v_inp_norm, in_v, N, hp.rms_eps);
                     }
                 }
+                }
             } else {
                 if (has_msg) {
                     if (T == 1 && hp.loop_gate_rank == 64 && (N & 3) == 0 &&
                         L.loop_down[0].type == 1 && L.loop_down[1].type == 1 && L.loop_down[2].type == 1 &&
                         L.loop_gain[0].type == 1 && L.loop_gain[1].type == 1 && L.loop_gain[2].type == 1) {
+#if defined(__HIP_PLATFORM_AMD__)
+                        k_loop_down_fused_f16_3way_t1_rdna4<<<dim3(32, 3), 192, 0, st>>>(
+                            (const uint16_t*) L.loop_down[0].d, (const uint16_t*) L.loop_down[1].d, (const uint16_t*) L.loop_down[2].d,
+                            cur, cur, cur, msg0, msg1, msg2, ctrl64, N, 64, hp.rms_eps);
+                        k_control_up_combine_f16_3way_t1_rdna4<<<dim3((unsigned) ((N + 15) / 16), 3), 128, 0, st>>>(
+                            cur, cur, cur, msg0, msg1, msg2,
+                            (const uint16_t*) L.loop_gain[0].d, (const uint16_t*) L.loop_gain[1].d, (const uint16_t*) L.loop_gain[2].d,
+                            (const uint16_t*) L.loop_forget[0].d, (const uint16_t*) L.loop_forget[1].d, (const uint16_t*) L.loop_forget[2].d,
+                            ctrl64, in_q, in_k, in_v, N);
+#else
                         k_loop_down_fused_f16_3way_t1<<<dim3(64, 3), 256, 0, st>>>(
                             (const uint16_t*) L.loop_down[0].d, (const uint16_t*) L.loop_down[1].d, (const uint16_t*) L.loop_down[2].d,
                             cur, msg0, msg1, msg2, ctrl64, N, 64, hp.rms_eps);
@@ -3846,6 +3972,7 @@ struct Engine {
                             (const uint16_t*) L.loop_gain[0].d, (const uint16_t*) L.loop_gain[1].d, (const uint16_t*) L.loop_gain[2].d,
                             (const uint16_t*) L.loop_forget[0].d, (const uint16_t*) L.loop_forget[1].d, (const uint16_t*) L.loop_forget[2].d,
                             ctrl64, in_q, in_k, in_v, 64, N);
+#endif
                     } else {
                         run_control(cur, msg0, L, 0, in_q, T);
                         run_control(cur, msg1, L, 1, in_k, T);
@@ -3861,12 +3988,12 @@ struct Engine {
                             (use_p2p_spin && N == 2304) ? peer.fg_in_v : nullptr,
                             (use_p2p_spin && N == 2304) ? peer.fg_xq_q : nullptr,
                             (use_p2p_spin && N == 2304) ? peer.fg_xq_k : nullptr,
-                            (use_p2p_spin && N == 2304) ? peer.fg_xq_v : nullptr);
+                            (use_p2p_spin && N == 2304) ? peer.fg_xq_v : nullptr,
+                            (use_p2p_spin && N == 2304) ? router_done_d : nullptr,
+                            (use_p2p_spin && N == 2304) ? peer.fg_flag1 : nullptr,
+                            (use_p2p_spin && N == 2304) ? (uint32_t) (il * 2 + 1) : 0u);
                         if (use_p2p_spin && N == 2304) {
-#if defined(__HIP_PLATFORM_AMD__)
-                            k_p2p_signal<<<1, 1, 0, st>>>(peer.fg_flag1, (uint32_t) (il * 2 + 1));
                             swa_p2p_pushed = true;
-#endif
                         }
                             q8_pre_done = true;
                         } else if (T > 8) {
@@ -3886,12 +4013,12 @@ struct Engine {
                             (use_p2p_spin && N == 2304) ? peer.fg_in_v : nullptr,
                             (use_p2p_spin && N == 2304) ? peer.fg_xq_q : nullptr,
                             (use_p2p_spin && N == 2304) ? peer.fg_xq_k : nullptr,
-                            (use_p2p_spin && N == 2304) ? peer.fg_xq_v : nullptr);
+                            (use_p2p_spin && N == 2304) ? peer.fg_xq_v : nullptr,
+                            (use_p2p_spin && N == 2304) ? router_done_d : nullptr,
+                            (use_p2p_spin && N == 2304) ? peer.fg_flag1 : nullptr,
+                            (use_p2p_spin && N == 2304) ? (uint32_t) (il * 2 + 1) : 0u);
                         if (use_p2p_spin && N == 2304) {
-#if defined(__HIP_PLATFORM_AMD__)
-                            k_p2p_signal<<<1, 1, 0, st>>>(peer.fg_flag1, (uint32_t) (il * 2 + 1));
                             swa_p2p_pushed = true;
-#endif
                         }
                             q8_pre_done = true;
                         } else if (T > 8) {
@@ -3932,12 +4059,12 @@ struct Engine {
                             (use_p2p_spin && N == 2304) ? peer.fg_in_v : nullptr,
                             (use_p2p_spin && N == 2304) ? peer.fg_xq_q : nullptr,
                             (use_p2p_spin && N == 2304) ? peer.fg_xq_k : nullptr,
-                            (use_p2p_spin && N == 2304) ? peer.fg_xq_v : nullptr);
+                            (use_p2p_spin && N == 2304) ? peer.fg_xq_v : nullptr,
+                            (use_p2p_spin && N == 2304) ? router_done_d : nullptr,
+                            (use_p2p_spin && N == 2304) ? peer.fg_flag1 : nullptr,
+                            (use_p2p_spin && N == 2304) ? (uint32_t) (il * 2 + 1) : 0u);
                         if (use_p2p_spin && N == 2304) {
-#if defined(__HIP_PLATFORM_AMD__)
-                            k_p2p_signal<<<1, 1, 0, st>>>(peer.fg_flag1, (uint32_t) (il * 2 + 1));
                             swa_p2p_pushed = true;
-#endif
                         }
                         q8_pre_done = true;
                     } else if (T > 8) {
@@ -4000,7 +4127,8 @@ struct Engine {
                                     float* rKconv, float* rVconv, float* rRelTab, float* rAtt,
                                     void* rAttXq, float* rSplit, float* rWo,
                                     int8_t* r_kq, __half* r_ks, int8_t* r_vq, __half* r_vs,
-                                    float* r_hst, const int32_t* r_pos0, bool is_primary) {
+                                    float* r_hst, const int32_t* r_pos0, bool is_primary,
+                                    uint32_t* sig_done = nullptr, uint32_t* sig_flag = nullptr, uint32_t sig_step = 0, bool* out_signaled = nullptr) {
                     project_preq_on(rst, rgemm, rAttXq, r_f16_scr, r_inq, r_xqq, w_sink, rSink, T, nh2, N, r_f16q);
                     float* pQ = rQ; float* pGate = rGate; float* pR = rR;
                     float* pK = rK; float* pV = rV; float* pDynK = rDynK; float* pDynV = rDynV;
@@ -4017,8 +4145,17 @@ struct Engine {
                             project_preq_on(rst, rgemm, rAttXq, r_f16_scr, r_inq, r_xqq, w_g, rGate, T, q2, N, r_f16q);
                             project_preq_on(rst, rgemm, rAttXq, r_f16_scr, r_inq, r_xqq, w_r, rR, T, rel2, N, r_f16q);
                         }
-                        project_preq_on(rst, rgemm, rAttXq, r_f16_scr, r_ink, r_xqk, w_k, rK, T, kv2, N, r_f16k);
-                        project_preq_on(rst, rgemm, rAttXq, r_f16_scr, r_inv, r_xqv, w_v, rV, T, kv2, N, (T > 8 && r_inv == r_inq) ? r_f16q : nullptr);
+                        if (T == 1 && r_xqk && r_xqk == r_xqv && w_k.type == 8 && w_v.type == 8 &&
+                            (N % 256) == 0 && (kv2 % 4) == 0 &&
+                            ((((uintptr_t) w_k.d) & 3u) == 0u) && ((((uintptr_t) w_v.d) & 3u) == 0u)) {
+                            const unsigned nb = (unsigned) ((2 * kv2 + 3) / 4);
+                            k_mmvq_q8_0_smallT<1, true, true><<<nb, 128, 0, rst>>>(
+                                (const uint8_t*) w_k.d, (const uint32_t*) r_xqk, rK, (int) N, (int) kv2, 1,
+                                (const uint8_t*) w_v.d, rV, (int) kv2);
+                        } else {
+                            project_preq_on(rst, rgemm, rAttXq, r_f16_scr, r_ink, r_xqk, w_k, rK, T, kv2, N, r_f16k);
+                            project_preq_on(rst, rgemm, rAttXq, r_f16_scr, r_inv, r_xqv, w_v, rV, T, kv2, N, (T > 8 && r_inv == r_inq) ? r_f16q : nullptr);
+                        }
                         if (!is_swa) {
                             project_preq_on(rst, rgemm, rAttXq, r_f16_scr, r_ink, r_xqk, w_kc, rDynK, T, dyn2, N, bf16_x_f16 ? r_f16k : nullptr);
                             project_preq_on(rst, rgemm, rAttXq, r_f16_scr, r_inv, r_xqv, w_vc, rDynV, T, dyn2, N, nullptr);
@@ -4087,6 +4224,15 @@ struct Engine {
                     if (!is_swa && rqs.active) {
                         run_qsa_indexer(rst, rgemm, rqs, rqdev, il, r_inq, r_ink, r_f16q, r_f16_scr, r_pos0, T, (int) pos, use_qsa_sparse);
                     }
+#if defined(__HIP_PLATFORM_AMD__)
+                    if (is_swa && T >= 1 && T <= 8 && hp.head_dim == 128 && nh2 == 3 * nkv2) {
+                        k_attn_q8_gqa3_swa_1pass_256<<<dim3((unsigned) nh2, (unsigned) T), 512, 0, rst>>>(
+                            pQ, r_kq, r_ks, r_vq, r_vs, rRelTab, rSink,
+                            pGate, rAtt, rAttXq, (int) nh2, (int) nkv2, (int) hp.n_rel_ext,
+                            kv_cap[(size_t) il], (int) hp.n_swa, r_pos0, kq_scale);
+                        att_xq_r = rAttXq;
+                    } else
+#endif
                     if (T < 16) {
                         const int sp = std::min(sp_cap, (T == 1)
                             ? (is_swa ? std::max(attn_split_t1_swa, 16) : (use_qsa_sparse ? std::min(attn_split_t1_full, 16) : attn_split_t1_full))
@@ -4114,6 +4260,7 @@ struct Engine {
                             pQ, r_kq, r_ks, r_vq, r_vs, rRelTab, rSink, pGate, rAtt,
                             (int) nh2, (int) nkv2, (int) hp.n_rel_ext, kv_cap[(size_t) il], is_swa ? 1 : 0, (int) hp.n_swa, r_pos0, kq_scale, T);
                     }
+                    (void) sig_done; (void) sig_flag; (void) sig_step; (void) out_signaled;
                     if (is_primary && evp) cudaEventRecord(ev_t[il][3], rst);
                     project_preq_on(rst, rgemm, rAttXq, r_f16_scr, rAtt, att_xq_r, w_out, rWo, T, N, q2);
                 };
@@ -4156,6 +4303,7 @@ struct Engine {
                     const void* p_xqq_fg = peer.fg_xq_q;
                     const void* p_xqk_fg = k_diff ? peer.fg_xq_k : peer.fg_xq_q;
                     const void* p_xqv_fg = v_diff ? peer.fg_xq_v : (v_eq_k ? p_xqk_fg : peer.fg_xq_q);
+                    bool peer_attn_signaled = false;
                     run_half(peer.st, peer.gemm,
                              PA.attn_q, PA.attn_gate, PA.attn_rel, PA.attn_k, PA.attn_v,
                              PA.attn_qgr, PA.attn_qgrkv, PA.attn_k_conv_proj, PA.attn_v_conv_proj,
@@ -4166,8 +4314,9 @@ struct Engine {
                              peer.K_conv, peer.V_conv, peer.rel_tab, peer.att,
                              peer.att_xq, peer.attn_split, peer.fg_wo_from_peer,
                              peer.kq[(size_t) il], peer.ks[(size_t) il], peer.vq[(size_t) il], peer.vs[(size_t) il],
-                             peer.conv_hist[(size_t) il], peer.pos0_d, false);
-                    k_p2p_signal<<<1, 1, 0, peer.st>>>(peer.fg_flag0, step_a);
+                             peer.conv_hist[(size_t) il], peer.pos0_d, false,
+                             peer.fg_done1, peer.fg_flag0, step_a, &peer_attn_signaled);
+                    if (!peer_attn_signaled) k_p2p_signal<<<1, 1, 0, peer.st>>>(peer.fg_flag0, step_a);
                     CK(cudaSetDevice(peer.primary_dev));
                 } else
 #endif
@@ -4388,6 +4537,12 @@ struct Engine {
                             attn_split, pGate, att, (int) hp.n_head, sp, pos0_d, 1, (int) hp.n_swa, xq);
                         att_xq_ready = xq;
                     } else if (is_swa && T >= 1 && T <= 8) {
+                        k_attn_q8_gqa3_swa_1pass_256<<<dim3((unsigned) hp.n_head, (unsigned) T), 512, 0, st>>>(
+                            pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink,
+                            pGate, att, xq, (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext,
+                            kv_cap[(size_t) il], (int) hp.n_swa, pos0_d, kq_scale);
+                        att_xq_ready = xq;
+                    } else if (false) {
 #else
                     if (is_swa && T >= 2 && T <= 8) {
 #endif
@@ -4625,10 +4780,21 @@ if (prof_detail) { CK(cudaStreamSynchronize(st)); p_d_attn += ms_since(tp_d2); }
             if (do_push) push_block(cur);
 
             // MoE
-            float* ffn_mix_out[1] = {in_ffn};
-            run_mix_normed(norm_blocks, ffn_inp, false, L.ffn_res_query, ffn_mix_out, 1, T, 0);
-            if (has_msg) run_control(in_ffn, msg3, L, 3, in_ffn, T);
-            if (T <= 8 && !include_route_t1 && (N & 31) == 0) {
+#if defined(__HIP_PLATFORM_AMD__)
+            const bool fused_ffn_mix_q8 = (!has_msg && T == 1 && !include_route_t1 &&
+                run_mix_rms_norm_q8_1_t1(norm_blocks, ffn_inp, false, L.ffn_res_query, in_ffn, L.ffn_norm, xq,
+                                         nullptr, (use_p2p_spin && N == 2304) ? peer.fg_xq_q : nullptr, nullptr, 0));
+#else
+            const bool fused_ffn_mix_q8 = false;
+#endif
+            if (!fused_ffn_mix_q8) {
+                float* ffn_mix_out[1] = {in_ffn};
+                run_mix_normed(norm_blocks, ffn_inp, false, L.ffn_res_query, ffn_mix_out, 1, T, 0);
+                if (has_msg) run_control(in_ffn, msg3, L, 3, in_ffn, T);
+            }
+            if (fused_ffn_mix_q8) {
+                // Already normalized + Q8_1 quantized (+ peer.fg_xq_q pushed)
+            } else if (T <= 8 && !include_route_t1 && (N & 31) == 0) {
                 k_rms_norm_q8_1<<<(unsigned) T, rms_q8_blk, 0, st>>>(
                     in_ffn, L.ffn_norm, in_ffn, xq, N, hp.rms_eps,
                     nullptr, (use_p2p_spin && N == 2304) ? peer.fg_xq_q : nullptr, nullptr, 0);
@@ -4678,7 +4844,15 @@ if (prof_detail) { CK(cudaStreamSynchronize(st)); p_d_attn += ms_since(tp_d2); }
             const bool is_hy = (L.n_slots < hp.n_expert);
             const bool xq_ffn_ready = (T <= 8 && !pre_routed_t1 && (N & 31) == 0);
             const bool f16_ffn_ready = (T >= 16 && (N & 3) == 0);
-            const bool fuse_comb_conv = (!is_hy && !L.tp_moe && T <= 8);
+#if defined(__HIP_PLATFORM_AMD__)
+            const bool can_fused_t1_1gpu = (!is_hy && !L.tp_moe && peer.dev < 0 && T == 1 && !pre_routed_t1 &&
+                                            L.L.gu_type == 40 && L.L.d_type == 40 && L.L.n_embd == 2304 &&
+                                            L.L.n_ff == 1152 && L.L.situ && L.L.had_block == 0 &&
+                                            hp.n_expert_used > 0 && hp.n_expert_used <= 8);
+#else
+            const bool can_fused_t1_1gpu = false;
+#endif
+            const bool fuse_comb_conv = (!is_hy && !L.tp_moe && T <= 8 && !can_fused_t1_1gpu);
             run_moe(L, il, in_ffn, T, pre_routed_t1, xq_ffn_ready, fuse_comb_conv, f16_ffn_ready, use_p2p_spin);
             const auto tp_mp0 = Clock::now();
             if (fuse_comb_conv) {
@@ -4832,8 +5006,15 @@ if (prof_detail) { CK(cudaStreamSynchronize(st)); p_d_attn += ms_since(tp_d2); }
 
             CK(cudaSetDevice(peer.dev));
             k_p2p_wait<<<1, 1, 0, peer.st>>>(peer.fg_flag1, step_h);
-            K::native_mmvq(m->peer_output_weight.type, m->peer_output_weight.d, peer.fg_xq_q, peer.logits,
-                           (int) N, (int) m->vocab_tp1, 1, peer.st);
+            if (m->peer_output_weight.type == 8 && (N % 256) == 0 && ((((uintptr_t) m->peer_output_weight.d) & 3u) == 0u)) {
+                const unsigned nb = (unsigned) ((m->vocab_tp1 + 3) / 4);
+                k_mmvq_q8_0_smallT<1, true, false><<<nb, 128, 0, peer.st>>>(
+                    (const uint8_t*) m->peer_output_weight.d, (const uint32_t*) peer.fg_xq_q, peer.logits,
+                    (int) N, (int) m->vocab_tp1, 1);
+            } else {
+                K::native_mmvq(m->peer_output_weight.type, m->peer_output_weight.d, peer.fg_xq_q, peer.logits,
+                               (int) N, (int) m->vocab_tp1, 1, peer.st);
+            }
             k_argmax_stage1<<<dim3(kArgBlks, 1), 256, 0, peer.st>>>(peer.logits, peer.argmax_val, peer.argmax_idx, (int) m->vocab_tp1);
             k_argmax_stage2<<<1, 32, 0, peer.st>>>(peer.argmax_val, peer.argmax_idx, peer.pick_d, kArgBlks);
             k_p2p_push_head_res<<<1, 1, 0, peer.st>>>(peer.logits, peer.pick_d, peer.fg_flag1,

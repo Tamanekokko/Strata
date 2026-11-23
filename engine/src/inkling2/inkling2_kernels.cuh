@@ -287,7 +287,8 @@ __global__ void k_rms_norm_3_q8_1(const float* __restrict__ x0, const float* __r
                                   void* __restrict__ xq0, void* __restrict__ xq1, void* __restrict__ xq2,
                                   int n, float eps,
                                   float* __restrict__ py0 = nullptr, float* __restrict__ py1 = nullptr, float* __restrict__ py2 = nullptr,
-                                  void* __restrict__ pxq0 = nullptr, void* __restrict__ pxq1 = nullptr, void* __restrict__ pxq2 = nullptr) {
+                                  void* __restrict__ pxq0 = nullptr, void* __restrict__ pxq1 = nullptr, void* __restrict__ pxq2 = nullptr,
+                                  uint32_t* __restrict__ done_cnt = nullptr, uint32_t* __restrict__ peer_flag = nullptr, uint32_t peer_step = 0) {
     __shared__ float sh[32];
     const int which = blockIdx.x, t = blockIdx.y;
     const float* xr = (which == 0 ? x0 : (which == 1 ? x1 : x2)) + (size_t) t * n;
@@ -332,6 +333,18 @@ __global__ void k_rms_norm_3_q8_1(const float* __restrict__ x0, const float* __r
             if (xqr) q8_1_warp_store(val, xqr, t * 72 + b, lane);
             if (pxqr) q8_1_warp_store(val, pxqr, t * 72 + b, lane);
         }
+#if defined(__HIP_PLATFORM_AMD__)
+        if (peer_flag && t == 0) {
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                __threadfence_system();
+                if (atomicAdd(done_cnt, 1u) == 2u) {
+                    *done_cnt = 0u;
+                    __hip_atomic_store(peer_flag, peer_step, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+                }
+            }
+        }
+#endif
         return;
     }
     const int n4 = n >> 2;
@@ -779,6 +792,107 @@ __global__ void k_mix_normed_fused(NormMixPtrs ptrs, int D, const float* __restr
 
 /// Single-pass register-cached multi-query mix for N == 2304 (n4 = 576, blockDim = 576 = 18 warps, D <= 8):
 /// Reads each ptrs.p[d] ONCE into registers (ZERO second HBM/L2 pass!) and runs 18 warps/token.
+#if defined(__HIP_PLATFORM_AMD__)
+// Fused k_mix_normed_fused_1pass<1> + k_rms_norm_q8_1 (+ optional P2P push & signal) in 1 CTA of 576 threads (18 warps)
+// for T=1, N=2304, NQ=1 (!has_msg SWA attn & FFN inputs). Eliminates 1 kernel launch + full 9KB roundtrip per call!
+__global__ void __launch_bounds__(576, 2) k_mix_rms_norm_q8_1_t1(
+    NormMixPtrs ptrs, int D, const float* __restrict__ q0,
+    float* __restrict__ y_out, const float* __restrict__ norm_w, void* __restrict__ xq_out,
+    float inv_sqrt_n, int norm_last, float rms_eps,
+    float* __restrict__ peer_y = nullptr, void* __restrict__ peer_xq = nullptr,
+    uint32_t* __restrict__ peer_flag = nullptr, uint32_t peer_step = 0) {
+    __shared__ float s_dot[8][18];
+    __shared__ float s_w[8];
+    __shared__ float s_sq[18];
+    __shared__ float s_x[2304];
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const float4 qv = reinterpret_cast<const float4*>(q0)[tid];
+    float4 cv[8];
+#pragma unroll
+    for (int d = 0; d < 8; ++d) {
+        if (d < D) {
+            float4 v = reinterpret_cast<const float4*>(ptrs.p[d])[tid];
+            if (norm_last && d == D - 1) {
+                float sq = v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+#pragma unroll
+                for (int o = 16; o > 0; o >>= 1) sq += __shfl_xor_sync(0xffffffffu, sq, o);
+                if (lane == 0) s_sq[warp] = sq;
+                __syncthreads();
+                float tot_sq = 0.0f;
+#pragma unroll
+                for (int w = 0; w < 18; ++w) tot_sq += s_sq[w];
+                const float r = rsqrtf(tot_sq * (1.0f / 2304.0f) + rms_eps);
+                v.x *= r; v.y *= r; v.z *= r; v.w *= r;
+            }
+            cv[d] = v;
+            float dot = v.x * qv.x + v.y * qv.y + v.z * qv.z + v.w * qv.w;
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, o);
+            if (lane == 0) s_dot[d][warp] = dot;
+        }
+    }
+    __syncthreads();
+    if (tid < D) {
+        float acc = 0.0f;
+#pragma unroll
+        for (int w = 0; w < 18; ++w) acc += s_dot[tid][w];
+        s_w[tid] = acc * inv_sqrt_n;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        float m = -1e30f;
+        for (int d = 0; d < D; ++d) m = fmaxf(m, s_w[d]);
+        float sum = 0.0f;
+        for (int d = 0; d < D; ++d) {
+            s_w[d] = __expf(s_w[d] - m);
+            sum += s_w[d];
+        }
+        const float inv = __fdividef(1.0f, sum);
+        for (int d = 0; d < D; ++d) s_w[d] *= inv;
+    }
+    __syncthreads();
+    float ax = 0.0f, ay = 0.0f, az = 0.0f, aw = 0.0f;
+#pragma unroll
+    for (int d = 0; d < 8; ++d) {
+        if (d < D) {
+            const float wd = s_w[d];
+            ax += wd * cv[d].x; ay += wd * cv[d].y; az += wd * cv[d].z; aw += wd * cv[d].w;
+        }
+    }
+    // Inline RMSNorm on mixed output
+    float sq = ax * ax + ay * ay + az * az + aw * aw;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) sq += __shfl_xor_sync(0xffffffffu, sq, o);
+    if (lane == 0) s_sq[warp] = sq;
+    __syncthreads();
+    float tot_sq = 0.0f;
+#pragma unroll
+    for (int w = 0; w < 18; ++w) tot_sq += s_sq[w];
+    const float inv_rms = rsqrtf(tot_sq * (1.0f / 2304.0f) + rms_eps);
+    const float4 nw = norm_w ? reinterpret_cast<const float4*>(norm_w)[tid] : make_float4(1.0f, 1.0f, 1.0f, 1.0f);
+    const float4 y4 = make_float4(ax * inv_rms * nw.x, ay * inv_rms * nw.y, az * inv_rms * nw.z, aw * inv_rms * nw.w);
+    reinterpret_cast<float4*>(y_out)[tid] = y4;
+    if (peer_y) reinterpret_cast<float4*>(peer_y)[tid] = y4;
+    reinterpret_cast<float4*>(s_x)[tid] = y4;
+    __syncthreads();
+    // 18 warps x 4 blocks = 72 Q8_1 blocks (2304 elements)
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int b = k * 18 + warp;
+        const float val = s_x[(b << 5) + lane];
+        if (xq_out) q8_1_warp_store(val, xq_out, b, lane);
+        if (peer_xq) q8_1_warp_store(val, peer_xq, b, lane);
+    }
+    if (peer_flag) {
+        __syncthreads();
+        if (tid == 0) {
+            __threadfence_system();
+            __hip_atomic_store(peer_flag, peer_step, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+        }
+    }
+}
+#endif
+
 template <int NQ>
 __global__ void __launch_bounds__(576, 2) k_mix_normed_fused_1pass(
     NormMixPtrs ptrs, int D, const float* __restrict__ q0, const float* __restrict__ q1,
@@ -1202,6 +1316,236 @@ __global__ void k_control_up_combine_f16_3way_t1(
         }
     }
 }
+
+#if defined(__HIP_PLATFORM_AMD__)
+// RDNA4-optimized FP16 loop_down: 192 threads (6 warps, exact divisor of 576=2304/4), 2 rows/block
+// Halves cur/msg loads & RMS reduction overhead and eliminates idle threads on tail iteration.
+__global__ void __launch_bounds__(192, 4) k_loop_down_fused_f16_t1_rdna4(
+    const uint16_t* __restrict__ W, const float* __restrict__ cur,
+    const float* __restrict__ msg, float* __restrict__ Y,
+    int N, int R, float eps) {
+    __shared__ float s_dc[2][6], s_dm[2][6], s_sc[6], s_sm[6];
+    const int o0 = (int) blockIdx.x * 2;
+    if (o0 >= R) return;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int n4 = N >> 2;
+    const uint2* wc0 = reinterpret_cast<const uint2*>(W + (size_t) o0 * (2 * N));
+    const uint2* wm0 = reinterpret_cast<const uint2*>(W + (size_t) o0 * (2 * N) + N);
+    const uint2* wc1 = reinterpret_cast<const uint2*>(W + (size_t) (o0 + 1) * (2 * N));
+    const uint2* wm1 = reinterpret_cast<const uint2*>(W + (size_t) (o0 + 1) * (2 * N) + N);
+    const float4* c4 = reinterpret_cast<const float4*>(cur);
+    const float4* m4 = reinterpret_cast<const float4*>(msg);
+    float dc0 = 0.0f, dm0 = 0.0f, dc1 = 0.0f, dm1 = 0.0f, sc = 0.0f, sm = 0.0f;
+    for (int i = tid; i < n4; i += 192) {
+        const float4 vc = c4[i];
+        const float4 vm = m4[i];
+        sc += vc.x * vc.x + vc.y * vc.y + vc.z * vc.z + vc.w * vc.w;
+        sm += vm.x * vm.x + vm.y * vm.y + vm.z * vm.z + vm.w * vm.w;
+        {
+            const uint2 u_wc = wc0[i];
+            const uint2 u_wm = wm0[i];
+            const float2 fwc0 = __half22float2(*reinterpret_cast<const __half2*>(&u_wc.x));
+            const float2 fwc1 = __half22float2(*reinterpret_cast<const __half2*>(&u_wc.y));
+            const float2 fwm0 = __half22float2(*reinterpret_cast<const __half2*>(&u_wm.x));
+            const float2 fwm1 = __half22float2(*reinterpret_cast<const __half2*>(&u_wm.y));
+            dc0 += fwc0.x * vc.x + fwc0.y * vc.y + fwc1.x * vc.z + fwc1.y * vc.w;
+            dm0 += fwm0.x * vm.x + fwm0.y * vm.y + fwm1.x * vm.z + fwm1.y * vm.w;
+        }
+        {
+            const uint2 u_wc = wc1[i];
+            const uint2 u_wm = wm1[i];
+            const float2 fwc0 = __half22float2(*reinterpret_cast<const __half2*>(&u_wc.x));
+            const float2 fwc1 = __half22float2(*reinterpret_cast<const __half2*>(&u_wc.y));
+            const float2 fwm0 = __half22float2(*reinterpret_cast<const __half2*>(&u_wm.x));
+            const float2 fwm1 = __half22float2(*reinterpret_cast<const __half2*>(&u_wm.y));
+            dc1 += fwc0.x * vc.x + fwc0.y * vc.y + fwc1.x * vc.z + fwc1.y * vc.w;
+            dm1 += fwm0.x * vm.x + fwm0.y * vm.y + fwm1.x * vm.z + fwm1.y * vm.w;
+        }
+    }
+#pragma unroll
+    for (int m = 16; m > 0; m >>= 1) {
+        dc0 += __shfl_xor_sync(0xffffffffu, dc0, m);
+        dm0 += __shfl_xor_sync(0xffffffffu, dm0, m);
+        dc1 += __shfl_xor_sync(0xffffffffu, dc1, m);
+        dm1 += __shfl_xor_sync(0xffffffffu, dm1, m);
+        sc  += __shfl_xor_sync(0xffffffffu, sc,  m);
+        sm  += __shfl_xor_sync(0xffffffffu, sm,  m);
+    }
+    if (lane == 0) {
+        s_dc[0][warp] = dc0; s_dm[0][warp] = dm0;
+        s_dc[1][warp] = dc1; s_dm[1][warp] = dm1;
+        s_sc[warp] = sc; s_sm[warp] = sm;
+    }
+    __syncthreads();
+    if (tid < 2) {
+        float tdc = 0.0f, tdm = 0.0f, tsc = 0.0f, tsm = 0.0f;
+#pragma unroll
+        for (int w = 0; w < 6; ++w) {
+            tdc += s_dc[tid][w]; tdm += s_dm[tid][w];
+            tsc += s_sc[w]; tsm += s_sm[w];
+        }
+        const float rc = rsqrtf(tsc / (float) N + eps);
+        const float rm = rsqrtf(tsm / (float) N + eps);
+        Y[o0 + tid] = tdc * rc + tdm * rm;
+    }
+}
+
+__global__ void __launch_bounds__(192, 4) k_loop_down_fused_f16_3way_t1_rdna4(
+    const uint16_t* __restrict__ W0, const uint16_t* __restrict__ W1, const uint16_t* __restrict__ W2,
+    const float* __restrict__ cur0, const float* __restrict__ cur1, const float* __restrict__ cur2,
+    const float* __restrict__ msg0, const float* __restrict__ msg1, const float* __restrict__ msg2,
+    float* __restrict__ Y, int N, int R, float eps) {
+    __shared__ float s_dc[2][6], s_dm[2][6], s_sc[6], s_sm[6];
+    const int o0 = (int) blockIdx.x * 2, which = blockIdx.y;
+    if (o0 >= R) return;
+    const uint16_t* W = (which == 0) ? W0 : ((which == 1) ? W1 : W2);
+    const float* cur = (which == 0) ? cur0 : ((which == 1) ? cur1 : cur2);
+    const float* msg = (which == 0) ? msg0 : ((which == 1) ? msg1 : msg2);
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int n4 = N >> 2;
+    const uint2* wc0 = reinterpret_cast<const uint2*>(W + (size_t) o0 * (2 * N));
+    const uint2* wm0 = reinterpret_cast<const uint2*>(W + (size_t) o0 * (2 * N) + N);
+    const uint2* wc1 = reinterpret_cast<const uint2*>(W + (size_t) (o0 + 1) * (2 * N));
+    const uint2* wm1 = reinterpret_cast<const uint2*>(W + (size_t) (o0 + 1) * (2 * N) + N);
+    const float4* c4 = reinterpret_cast<const float4*>(cur);
+    const float4* m4 = reinterpret_cast<const float4*>(msg);
+    float dc0 = 0.0f, dm0 = 0.0f, dc1 = 0.0f, dm1 = 0.0f, sc = 0.0f, sm = 0.0f;
+    for (int i = tid; i < n4; i += 192) {
+        const float4 vc = c4[i];
+        const float4 vm = m4[i];
+        sc += vc.x * vc.x + vc.y * vc.y + vc.z * vc.z + vc.w * vc.w;
+        sm += vm.x * vm.x + vm.y * vm.y + vm.z * vm.z + vm.w * vm.w;
+        {
+            const uint2 u_wc = wc0[i];
+            const uint2 u_wm = wm0[i];
+            const float2 fwc0 = __half22float2(*reinterpret_cast<const __half2*>(&u_wc.x));
+            const float2 fwc1 = __half22float2(*reinterpret_cast<const __half2*>(&u_wc.y));
+            const float2 fwm0 = __half22float2(*reinterpret_cast<const __half2*>(&u_wm.x));
+            const float2 fwm1 = __half22float2(*reinterpret_cast<const __half2*>(&u_wm.y));
+            dc0 += fwc0.x * vc.x + fwc0.y * vc.y + fwc1.x * vc.z + fwc1.y * vc.w;
+            dm0 += fwm0.x * vm.x + fwm0.y * vm.y + fwm1.x * vm.z + fwm1.y * vm.w;
+        }
+        {
+            const uint2 u_wc = wc1[i];
+            const uint2 u_wm = wm1[i];
+            const float2 fwc0 = __half22float2(*reinterpret_cast<const __half2*>(&u_wc.x));
+            const float2 fwc1 = __half22float2(*reinterpret_cast<const __half2*>(&u_wc.y));
+            const float2 fwm0 = __half22float2(*reinterpret_cast<const __half2*>(&u_wm.x));
+            const float2 fwm1 = __half22float2(*reinterpret_cast<const __half2*>(&u_wm.y));
+            dc1 += fwc0.x * vc.x + fwc0.y * vc.y + fwc1.x * vc.z + fwc1.y * vc.w;
+            dm1 += fwm0.x * vm.x + fwm0.y * vm.y + fwm1.x * vm.z + fwm1.y * vm.w;
+        }
+    }
+#pragma unroll
+    for (int m = 16; m > 0; m >>= 1) {
+        dc0 += __shfl_xor_sync(0xffffffffu, dc0, m);
+        dm0 += __shfl_xor_sync(0xffffffffu, dm0, m);
+        dc1 += __shfl_xor_sync(0xffffffffu, dc1, m);
+        dm1 += __shfl_xor_sync(0xffffffffu, dm1, m);
+        sc  += __shfl_xor_sync(0xffffffffu, sc,  m);
+        sm  += __shfl_xor_sync(0xffffffffu, sm,  m);
+    }
+    if (lane == 0) {
+        s_dc[0][warp] = dc0; s_dm[0][warp] = dm0;
+        s_dc[1][warp] = dc1; s_dm[1][warp] = dm1;
+        s_sc[warp] = sc; s_sm[warp] = sm;
+    }
+    __syncthreads();
+    if (tid < 2) {
+        float tdc = 0.0f, tdm = 0.0f, tsc = 0.0f, tsm = 0.0f;
+#pragma unroll
+        for (int w = 0; w < 6; ++w) {
+            tdc += s_dc[tid][w]; tdm += s_dm[tid][w];
+            tsc += s_sc[w]; tsm += s_sm[w];
+        }
+        const float rc = rsqrtf(tsc / (float) N + eps);
+        const float rm = rsqrtf(tsm / (float) N + eps);
+        Y[which * R + o0 + tid] = tdc * rc + tdm * rm;
+    }
+}
+
+// RDNA4-optimized FP16 control_up_combine: 128 threads = 16 subwarps of 8 threads, 16 rows/block, 128-bit uint4 loads!
+__global__ void __launch_bounds__(128, 8) k_control_up_combine_f16_t1_rdna4(
+    const float* __restrict__ cur, const float* __restrict__ msg,
+    const uint16_t* __restrict__ w_gain, const uint16_t* __restrict__ w_forget,
+    const float* __restrict__ ctrl64, float* __restrict__ out, int N) {
+    __shared__ float sx[64];
+    if (threadIdx.x < 64) sx[threadIdx.x] = ctrl64[threadIdx.x];
+    __syncthreads();
+    const int o = (int) blockIdx.x * 16 + (threadIdx.x >> 3);
+    const int t = threadIdx.x & 7;
+    if (o >= N) return;
+    const float4 x0 = reinterpret_cast<const float4*>(sx)[t * 2];
+    const float4 x1 = reinterpret_cast<const float4*>(sx)[t * 2 + 1];
+    const uint4 ug = reinterpret_cast<const uint4*>(w_gain + (size_t) o * 64)[t];
+    const uint4 uf = reinterpret_cast<const uint4*>(w_forget + (size_t) o * 64)[t];
+    const float2 g0 = __half22float2(*reinterpret_cast<const __half2*>(&ug.x));
+    const float2 g1 = __half22float2(*reinterpret_cast<const __half2*>(&ug.y));
+    const float2 g2 = __half22float2(*reinterpret_cast<const __half2*>(&ug.z));
+    const float2 g3 = __half22float2(*reinterpret_cast<const __half2*>(&ug.w));
+    const float2 f0 = __half22float2(*reinterpret_cast<const __half2*>(&uf.x));
+    const float2 f1 = __half22float2(*reinterpret_cast<const __half2*>(&uf.y));
+    const float2 f2 = __half22float2(*reinterpret_cast<const __half2*>(&uf.z));
+    const float2 f3 = __half22float2(*reinterpret_cast<const __half2*>(&uf.w));
+    float ag = g0.x * x0.x + g0.y * x0.y + g1.x * x0.z + g1.y * x0.w
+             + g2.x * x1.x + g2.y * x1.y + g3.x * x1.z + g3.y * x1.w;
+    float af = f0.x * x0.x + f0.y * x0.y + f1.x * x0.z + f1.y * x0.w
+             + f2.x * x1.x + f2.y * x1.y + f3.x * x1.z + f3.y * x1.w;
+#pragma unroll
+    for (int m = 4; m > 0; m >>= 1) {
+        ag += __shfl_xor_sync(0xffffffffu, ag, m);
+        af += __shfl_xor_sync(0xffffffffu, af, m);
+    }
+    if (t == 0) {
+        out[o] = (1.0f - fast_tanh(af)) * cur[o] + fast_tanh(ag) * msg[o];
+    }
+}
+
+__global__ void __launch_bounds__(128, 8) k_control_up_combine_f16_3way_t1_rdna4(
+    const float* __restrict__ cur0, const float* __restrict__ cur1, const float* __restrict__ cur2,
+    const float* __restrict__ msg0, const float* __restrict__ msg1, const float* __restrict__ msg2,
+    const uint16_t* __restrict__ wg0, const uint16_t* __restrict__ wg1, const uint16_t* __restrict__ wg2,
+    const uint16_t* __restrict__ wf0, const uint16_t* __restrict__ wf1, const uint16_t* __restrict__ wf2,
+    const float* __restrict__ ctrl64,
+    float* __restrict__ out0, float* __restrict__ out1, float* __restrict__ out2, int N) {
+    __shared__ float sx[64];
+    const int which = blockIdx.y;
+    if (threadIdx.x < 64) sx[threadIdx.x] = ctrl64[which * 64 + threadIdx.x];
+    __syncthreads();
+    const int o = (int) blockIdx.x * 16 + (threadIdx.x >> 3);
+    const int t = threadIdx.x & 7;
+    if (o >= N) return;
+    const float* cur = (which == 0) ? cur0 : ((which == 1) ? cur1 : cur2);
+    const float* msg = (which == 0) ? msg0 : ((which == 1) ? msg1 : msg2);
+    const uint16_t* w_gain = (which == 0) ? wg0 : ((which == 1) ? wg1 : wg2);
+    const uint16_t* w_forget = (which == 0) ? wf0 : ((which == 1) ? wf1 : wf2);
+    float* out = (which == 0) ? out0 : ((which == 1) ? out1 : out2);
+    const float4 x0 = reinterpret_cast<const float4*>(sx)[t * 2];
+    const float4 x1 = reinterpret_cast<const float4*>(sx)[t * 2 + 1];
+    const uint4 ug = reinterpret_cast<const uint4*>(w_gain + (size_t) o * 64)[t];
+    const uint4 uf = reinterpret_cast<const uint4*>(w_forget + (size_t) o * 64)[t];
+    const float2 g0 = __half22float2(*reinterpret_cast<const __half2*>(&ug.x));
+    const float2 g1 = __half22float2(*reinterpret_cast<const __half2*>(&ug.y));
+    const float2 g2 = __half22float2(*reinterpret_cast<const __half2*>(&ug.z));
+    const float2 g3 = __half22float2(*reinterpret_cast<const __half2*>(&ug.w));
+    const float2 f0 = __half22float2(*reinterpret_cast<const __half2*>(&uf.x));
+    const float2 f1 = __half22float2(*reinterpret_cast<const __half2*>(&uf.y));
+    const float2 f2 = __half22float2(*reinterpret_cast<const __half2*>(&uf.z));
+    const float2 f3 = __half22float2(*reinterpret_cast<const __half2*>(&uf.w));
+    float ag = g0.x * x0.x + g0.y * x0.y + g1.x * x0.z + g1.y * x0.w
+             + g2.x * x1.x + g2.y * x1.y + g3.x * x1.z + g3.y * x1.w;
+    float af = f0.x * x0.x + f0.y * x0.y + f1.x * x0.z + f1.y * x0.w
+             + f2.x * x1.x + f2.y * x1.y + f3.x * x1.z + f3.y * x1.w;
+#pragma unroll
+    for (int m = 4; m > 0; m >>= 1) {
+        ag += __shfl_xor_sync(0xffffffffu, ag, m);
+        af += __shfl_xor_sync(0xffffffffu, af, m);
+    }
+    if (t == 0) {
+        out[o] = (1.0f - fast_tanh(af)) * cur[o] + fast_tanh(ag) * msg[o];
+    }
+}
+#endif
 
 __global__ void k_control_up_combine_t1(const float* __restrict__ cur, const float* __restrict__ msg,
                                         const float* __restrict__ w_gain, const float* __restrict__ w_forget,
@@ -7660,6 +8004,132 @@ __global__ void k_attn_split_combine(const float* __restrict__ split_out, const 
 
 /// 1-pass SWA Q8 attention (T <= 8, is_swa=1, head_dim=128, n_head=3*n_head_kv) with fused sigmoid gate + optional Q8_1 store:
 /// Grid (n_head, T) = 96 CTAs at T=4, block 128 (8 half-warps). Eliminates split_out, k_attn_split_combine, AND native_quantize_q8_1 before O!
+#if defined(__HIP_PLATFORM_AMD__)
+// RDNA4 256-thread (16 half-warps) 1-pass SWA Q8 attention with __half s_acc[16][128] (4 KB LDS).
+// Halves loop iterations on full 1024-token SWA window (64 vs 128 iters) while keeping high occupancy.
+__global__ void __launch_bounds__(512, 2) k_attn_q8_gqa3_swa_1pass_256(
+    const float* __restrict__ Q,
+    const int8_t* __restrict__ kq, const __half* __restrict__ ks,
+    const int8_t* __restrict__ vq, const __half* __restrict__ vs,
+    const float* __restrict__ rel_tab, const float* __restrict__ sink,
+    const float* __restrict__ gate, float* __restrict__ out, void* __restrict__ xq_out,
+    int n_head, int n_head_kv, int n_ext, int cap, int n_swa,
+    const int32_t* __restrict__ pos0, float kq_scale) {
+    __shared__ __half2 sq2[64];
+    __shared__ float s_m[32];
+    __shared__ float s_l[32];
+    __shared__ __half s_acc[32][128];
+    const int h = blockIdx.x, t = blockIdx.y;
+    const int hkv = h / 3;
+    const int tid = threadIdx.x;
+    const int hw = tid >> 4;     // 0..31
+    const int hlane = tid & 15;  // 0..15
+    const int kv_dim = n_head_kv * 128;
+    constexpr float kLog2e = 1.4426950408889634f;
+    const float kq_l2 = kq_scale * kLog2e;
+
+    if (tid < 64) {
+        const float2 qf = *reinterpret_cast<const float2*>(Q + ((size_t) t * n_head + h) * 128 + tid * 2);
+        sq2[tid] = __float22half2_rn(qf);
+    }
+    __syncthreads();
+
+    const int base8 = hlane * 8;
+    const __half2 q0 = sq2[hlane * 4 + 0];
+    const __half2 q1 = sq2[hlane * 4 + 1];
+    const __half2 q2 = sq2[hlane * 4 + 2];
+    const __half2 q3 = sq2[hlane * 4 + 3];
+
+    const int pos_q = pos0[0] + t;
+    const int j0 = max(0, pos_q - n_swa + 1);
+    const int j1 = pos_q + 1;
+    const float* rt = rel_tab + ((size_t) t * n_head + h) * n_ext;
+    const float neg_sink2 = -__ldg(&sink[(size_t) t * n_head + h]) * kLog2e;
+
+    const __half2 z2 = __half2half2(__float2half(0.0f));
+    float m = (hw == 0) ? 0.0f : -1e30f;
+    float l = (hw == 0) ? 1.0f : 0.0f;
+    __half2 acc0 = z2, acc1 = z2, acc2 = z2, acc3 = z2;
+
+    const bool pow2_cap = (cap & (cap - 1)) == 0;
+    const int cap_mask = cap - 1;
+    const unsigned hw_mask = (hw & 1) ? 0xffff0000u : 0x0000ffffu;
+
+    for (int j = j0 + hw; j < j1; j += 32) {
+        const int slot = pow2_cap ? (j & cap_mask) : (j % cap);
+        const size_t idx = (size_t) slot * n_head_kv + hkv;
+        const float dkkq2 = __half2float(__ldg(&ks[idx])) * kq_l2;
+        const float d_v = __half2float(__ldg(&vs[idx]));
+        const uint2 k8 = *reinterpret_cast<const uint2*>(kq + (size_t) slot * kv_dim + hkv * 128 + base8);
+        const uint2 v8 = *reinterpret_cast<const uint2*>(vq + (size_t) slot * kv_dim + hkv * 128 + base8);
+        __half2 kh0, kh1, kh2, kh3, vh0, vh1, vh2, vh3;
+        i8x4_to_h2x2(k8.x, kh0, kh1);
+        i8x4_to_h2x2(k8.y, kh2, kh3);
+        i8x4_to_h2x2(v8.x, vh0, vh1);
+        i8x4_to_h2x2(v8.y, vh2, vh3);
+        __half2 d2 = __hmul2(q0, kh0);
+        d2 = __hfma2(q1, kh1, d2);
+        d2 = __hfma2(q2, kh2, d2);
+        d2 = __hfma2(q3, kh3, d2);
+        float dt = __half2float(__low2half(d2)) + __half2float(__high2half(d2));
+#pragma unroll
+        for (int o = 8; o > 0; o >>= 1) dt += __shfl_xor_sync(hw_mask, dt, o, 16);
+        const int dist = pos_q - j;
+        const float bias = dist < n_ext ? (__ldg(&rt[dist]) * kLog2e) : neg_sink2;
+        const float sc = dt * dkkq2 + bias;
+        float p;
+        if (sc > m) {
+            const float alpha = l > 0.0f ? fast_exp2f_hw(m - sc) : 0.0f;
+            const __half2 a2 = __half2half2(__float2half(alpha));
+            l = l * alpha + 1.0f;
+            acc0 = __hmul2(acc0, a2);
+            acc1 = __hmul2(acc1, a2);
+            acc2 = __hmul2(acc2, a2);
+            acc3 = __hmul2(acc3, a2);
+            m = sc;
+            p = 1.0f;
+        } else {
+            p = fast_exp2f_hw(sc - m);
+            l += p;
+        }
+        const __half2 pv2 = __half2half2(__float2half(p * d_v));
+        acc0 = __hfma2(pv2, vh0, acc0);
+        acc1 = __hfma2(pv2, vh1, acc1);
+        acc2 = __hfma2(pv2, vh2, acc2);
+        acc3 = __hfma2(pv2, vh3, acc3);
+    }
+
+    if (hlane == 0) { s_m[hw] = m; s_l[hw] = l; }
+    *reinterpret_cast<__half2*>(&s_acc[hw][base8 + 0]) = acc0;
+    *reinterpret_cast<__half2*>(&s_acc[hw][base8 + 2]) = acc1;
+    *reinterpret_cast<__half2*>(&s_acc[hw][base8 + 4]) = acc2;
+    *reinterpret_cast<__half2*>(&s_acc[hw][base8 + 6]) = acc3;
+    __syncthreads();
+
+    if (tid < 128) {
+        float mg = -1e30f;
+#pragma unroll
+        for (int w = 0; w < 32; ++w) if (s_l[w] > 0.0f && s_m[w] > mg) mg = s_m[w];
+        float lg = 0.0f, og = 0.0f;
+#pragma unroll
+        for (int w = 0; w < 32; ++w) {
+            if (s_l[w] > 0.0f) {
+                const float c = exp2f(s_m[w] - mg);
+                lg += s_l[w] * c;
+                og += __half2float(s_acc[w][tid]) * c;
+            }
+        }
+        const size_t oi = ((size_t) t * n_head + h) * 128 + tid;
+        float val = __fdividef(og, lg);
+        if (gate) val *= sigmf(gate[oi]);
+        out[oi] = val;
+        if (xq_out) {
+            q8_1_warp_store(val, xq_out, (t * n_head + h) * 4 + (tid >> 5), tid & 31);
+        }
+    }
+}
+#endif
+
 __global__ void __launch_bounds__(128, 8) k_attn_q8_gqa3_swa_1pass(
     const float* __restrict__ Q,
     const int8_t* __restrict__ kq, const __half* __restrict__ ks,
@@ -7944,6 +8414,107 @@ __global__ void k_route_inkling2(const float* __restrict__ logits, const float* 
 
 /// Fused k_route_inkling2 + k_group_experts in 1 CTA for full-VRAM small-T (T <= 8, n_exp <= 128, top_k <= 16):
 /// Block = 128 (T <= 4) or 256 (T <= 8). Zero global ids roundtrip, zero second kernel launch!
+#if defined(__HIP_PLATFORM_AMD__)
+// Fused F32 Router GEMV + Top-K Routing (+ optional P2P push) in 1 kernel for T=1, N=2304, n_exp=128.
+// 16 blocks x 256 threads (8 warps/block = 128 warps = 128 experts).
+// Caches x[2304] in LDS once per block (8x fewer x loads vs 128-block CTA GEMV), eliminates k_route_inkling2 launch!
+__global__ void __launch_bounds__(256, 2) k_gemv_route_inkling2_t1(
+    const float* __restrict__ W, const float* __restrict__ x, float* __restrict__ logits,
+    const float* __restrict__ bias, int32_t* __restrict__ ids, float* __restrict__ ewts,
+    uint32_t* __restrict__ done_cnt, int top_k, float scale,
+    uint32_t* __restrict__ d_hits = nullptr,
+    int32_t* __restrict__ peer_ids = nullptr, float* __restrict__ peer_ewts = nullptr,
+    uint32_t* __restrict__ peer_flag = nullptr, uint32_t peer_step = 0) {
+    __shared__ float sx[2304];
+    __shared__ int s_last;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const float4* x4 = reinterpret_cast<const float4*>(x);
+    float4* sx4 = reinterpret_cast<float4*>(sx);
+    for (int i = tid; i < 576; i += 256) sx4[i] = x4[i];
+    __syncthreads();
+
+    const int e = (int) blockIdx.x * 8 + warp;
+    const float4* w4 = reinterpret_cast<const float4*>(W + (size_t) e * 2304);
+    float acc = 0.0f;
+#pragma unroll 6
+    for (int i = lane; i < 576; i += 32) {
+        const float4 a = w4[i];
+        const float4 b = sx4[i];
+        acc += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    if (lane == 0) {
+        __hip_atomic_store(&logits[e], acc, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    }
+    __syncthreads();
+    if (tid == 0) {
+        __threadfence();
+        s_last = (atomicAdd(done_cnt, 1u) == 15u) ? 1 : 0;
+    }
+    __syncthreads();
+    if (!s_last || warp != 0) return;
+
+    // Last block warp 0 runs exact k_route_inkling2 logic on L2-hot logits[0..127]
+    float p[4], sc[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int idx = j * 32 + lane;
+        const float lg = __hip_atomic_load(&logits[idx], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        const float pr = sigmf(lg);
+        p[j] = pr;
+        sc[j] = pr + (bias ? bias[idx] : 0.0f);
+    }
+    float wlocal[16];
+    float wsum = 0.0f;
+    for (int k = 0; k < top_k; ++k) {
+        float bv = sc[0];
+        int be = lane;
+        float bp = p[0];
+#pragma unroll
+        for (int j = 1; j < 4; ++j) {
+            if (sc[j] > bv) {
+                bv = sc[j];
+                be = j * 32 + lane;
+                bp = p[j];
+            }
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+            const int oe = __shfl_xor_sync(0xffffffffu, be, o);
+            const float op = __shfl_xor_sync(0xffffffffu, bp, o);
+            if (ov > bv || (ov == bv && oe < be)) {
+                bv = ov;
+                be = oe;
+                bp = op;
+            }
+        }
+        if (lane == 0) {
+            ids[k] = be;
+            if (peer_ids) peer_ids[k] = be;
+            if (d_hits) atomicAdd(&d_hits[be], 1u);
+            wlocal[k] = bp;
+            wsum += bp;
+        }
+        if ((be & 31) == lane) sc[be >> 5] = -1e30f;
+    }
+    if (lane == 0) {
+        *done_cnt = 0u;
+        const float denom = fmaxf(wsum, 6.103515625e-5f);
+        const float fac = scale / denom;
+        for (int k = 0; k < top_k; ++k) {
+            const float ew = wlocal[k] * fac;
+            ewts[k] = ew;
+            if (peer_ewts) peer_ewts[k] = ew;
+        }
+        if (peer_flag) {
+            __hip_atomic_store(peer_flag, peer_step, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+        }
+    }
+}
+#endif
+
 __global__ void k_route_and_group_smallT(const float* __restrict__ logits, const float* __restrict__ bias,
                                          int32_t* __restrict__ ids, float* __restrict__ ewts,
                                          const int32_t* __restrict__ slot_of, const uint8_t* __restrict__ blobs,
