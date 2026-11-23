@@ -1214,6 +1214,7 @@ struct Engine {
     size_t ckpt_pin_cap = 0;
     uint16_t* act_bf16 = nullptr;    // FP16 scratch [max(tmax*2*N, 16*4*N)]
     uint16_t* act_bf16_only = nullptr; // Dedicated BF16 scratch on sm_75+ (!bf16_x_f16) so BF16 projections never clobber FP16 act_bf16
+    uint16_t* attn_f16_scr = nullptr;  // Dedicated FP16 scratch for GPU0 TP-attn & QSA (never aliases layer_arena Overlay A!)
 
     void *xq = nullptr, *xq_k = nullptr, *xq_v = nullptr, *escr = nullptr;
     size_t escr_bytes = 0;
@@ -2015,7 +2016,7 @@ struct Engine {
         cudaFree(sink);
         cudaFree(attn_split);
         cudaFree(router_logits); cudaFree(router_done_d); cudaFree(ewts);
-        cudaFree(logits); cudaFree(act_bf16); cudaFree(act_bf16_only);
+        cudaFree(logits); cudaFree(act_bf16); cudaFree(act_bf16_only); cudaFree(attn_f16_scr);
         cudaFree(xq); cudaFree(xq_k); cudaFree(xq_v);
         cudaFree(layer_arena);
         cudaFree(ids); cudaFree(grp_start); cudaFree(n_groups); cudaFree(ent_dst); cudaFree(ent_tok); cudaFree(grp_ptr);
@@ -2211,6 +2212,7 @@ struct Engine {
         // Minimum sizing accommodates DSpark draft FFN down (block_n=8, K_in=4*N) and joint_proj even with small --chunk.
         const size_t act_elems = std::max<size_t>((size_t) tmax * 2 * (size_t) N, (size_t) 16 * 4 * (size_t) N);
         CK(cudaMalloc(&act_bf16, act_elems * sizeof(uint16_t)));
+        CK(cudaMalloc(&attn_f16_scr, (size_t) tmax * (size_t) std::max<int64_t>(N, hp.q_dim) * sizeof(uint16_t)));
         if (!bf16_x_f16 && max_bf16_w > 0) {
             CK(cudaMalloc(&act_bf16_only, act_elems * sizeof(uint16_t)));
         }
@@ -4389,7 +4391,7 @@ struct Engine {
                              L.attn_qgr, L.attn_qgrkv, L.attn_k_conv_proj, L.attn_v_conv_proj,
                              L.attn_sink_proj, L.attn_output,
                              L.attn_q_clip, L.attn_rel_clip, L.attn_rel_bias, L.attn_k_conv, L.attn_v_conv,
-                             in_q, ink_src, inv_src, xq, xq_k_src, xq_v_src, f16_q, f16_k_pre, (uint16_t*) escr,
+                             in_q, ink_src, inv_src, xq, xq_k_src, xq_v_src, f16_q, f16_k_pre, attn_f16_scr,
                              Q, att_gate, R, K, V, sink, dyn_k, dyn_v, qgr_t1, K_conv, V_conv, rel_tab, att,
                              xq, attn_split, wo,
                              kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il],
@@ -4477,7 +4479,7 @@ struct Engine {
                          L.attn_qgr, L.attn_qgrkv, L.attn_k_conv_proj, L.attn_v_conv_proj,
                          L.attn_sink_proj, L.attn_output,
                          L.attn_q_clip, L.attn_rel_clip, L.attn_rel_bias, L.attn_k_conv, L.attn_v_conv,
-                         in_q, ink_src, inv_src, xq, xq_k_src, xq_v_src, f16_q, f16_k_pre, (uint16_t*) escr,
+                         in_q, ink_src, inv_src, xq, xq_k_src, xq_v_src, f16_q, f16_k_pre, attn_f16_scr,
                          Q, att_gate, R, K, V, sink, dyn_k, dyn_v, qgr_t1, K_conv, V_conv, rel_tab, att,
                          xq, attn_split, wo,
                          kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il],
@@ -4673,7 +4675,7 @@ struct Engine {
                                       : std::clamp((sm_count * 16) / std::max(1, (int) hp.n_head_kv * T), 16, kAttnSplitMax)));
                         bool use_qsa_1g_t1 = false;
                         if (!is_swa && qsa_st0.active && T == 1) {
-                            run_qsa_indexer(st, gemm, qsa_st0, m->qsa.dev0, il, in_q, ink_src, nullptr, (uint16_t*) escr, pos0_d, 1, (int) pos, use_qsa_1g_t1);
+                            run_qsa_indexer(st, gemm, qsa_st0, m->qsa.dev0, il, in_q, ink_src, nullptr, attn_f16_scr, pos0_d, 1, (int) pos, use_qsa_1g_t1);
                         }
                         if (use_qsa_1g_t1) {
                             k_attn_q8_gqa3_qsa_split<<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 0, st>>>(
@@ -4702,7 +4704,7 @@ struct Engine {
                         bool use_qsa_1g_pp = false;
                         if (!is_swa && qsa_st0.active) {
                             // Pass nullptr for r_f16q: 1-GPU project_preq(inv_src) overwrites act_bf16 (= f16_q) when inv_src != in_q!
-                            run_qsa_indexer(st, gemm, qsa_st0, m->qsa.dev0, il, in_q, ink_src, nullptr, (uint16_t*) escr, pos0_d, T, (int) pos, use_qsa_1g_pp);
+                            run_qsa_indexer(st, gemm, qsa_st0, m->qsa.dev0, il, in_q, ink_src, nullptr, attn_f16_scr, pos0_d, T, (int) pos, use_qsa_1g_pp);
                         }
                         if (use_qsa_1g_pp && has_hip_wmma) {
                             k_attn_q8_gqa3_qsa_pp_wmma<<<dim3((unsigned) hp.n_head, (unsigned) ((T + 15) / 16)), 128, 29696, st>>>(
