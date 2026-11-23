@@ -637,54 +637,76 @@ bool load_model(const std::string& path, Model& m, std::string& err, int peer_de
         err = "expected architecture inkling2";
         return false;
     }
+    const auto* arch_mv = meta.get("general.architecture");
+    const std::string arch_str = arch_mv ? arch_mv->s : std::string("inkling2");
+    const bool is_loop_arch = (arch_str == "inkling2_loop");
+    const std::string pfx = arch_str + ".";
     auto get_i = [&](const char* k, int64_t def) -> int64_t {
-        const auto* v = meta.get(k);
+        const auto* v = meta.get(pfx + k);
         return v && v->is_num() ? (int64_t) v->u : def;
     };
     auto get_f = [&](const char* k, float def) -> float {
-        const auto* v = meta.get(k);
+        const auto* v = meta.get(pfx + k);
         return v ? (float) v->num() : def;
     };
     Hparams& hp = m.hp;
-    hp.n_layer = get_i("inkling2.block_count", 48);
-    hp.num_loops = get_i("inkling2.num_loops", 3);
-    hp.core_start = get_i("inkling2.loop.core_start", 6);
-    hp.core_end = get_i("inkling2.loop.core_end", 18);
+    if (is_loop_arch) {
+        hp.num_loops = get_i("loop.count", 3);
+        hp.core_start = get_i("loop.start", 6);
+        hp.core_end = get_i("loop.end", 18);
+        const int64_t n_core = hp.num_loops > 1 ? (hp.core_end - hp.core_start) : 0;
+        hp.n_phys = get_i("block_count", 24);
+        hp.n_layer = hp.n_phys + (hp.num_loops - 1) * n_core;
+    } else {
+        hp.n_layer = get_i("block_count", 48);
+        hp.num_loops = get_i("num_loops", 3);
+        hp.core_start = get_i("loop.core_start", 6);
+        hp.core_end = get_i("loop.core_end", 18);
+        const int64_t n_core = hp.num_loops > 1 ? (hp.core_end - hp.core_start) : 0;
+        hp.n_phys = hp.n_layer - (hp.num_loops - 1) * n_core;
+    }
     const int64_t n_core = hp.num_loops > 1 ? (hp.core_end - hp.core_start) : 0;
-    hp.n_phys = hp.n_layer - (hp.num_loops - 1) * n_core;
-    hp.n_embd = get_i("inkling2.embedding_length", 2304);
-    hp.n_ff = get_i("inkling2.expert_feed_forward_length", get_i("inkling2.feed_forward_length", 1152));
-    if (const auto* v = meta.get("inkling2.attention.head_count")) {
+    hp.n_embd = get_i("embedding_length", 2304);
+    hp.n_ff = get_i("expert_feed_forward_length", get_i("feed_forward_length", 1152));
+    if (const auto* v = meta.get(pfx + "attention.head_count")) {
         hp.n_head = !v->items.empty() ? (int64_t) v->items[0].u : (int64_t) v->u;
     }
-    if (const auto* v = meta.get("inkling2.attention.head_count_kv")) {
+    if (const auto* v = meta.get(pfx + "attention.head_count_kv")) {
         hp.n_head_kv = !v->items.empty() ? (int64_t) v->items[0].u : (int64_t) v->u;
     }
-    hp.head_dim = get_i("inkling2.attention.key_length", 128);
+    hp.head_dim = get_i("attention.key_length", 128);
     hp.q_dim = hp.n_head * hp.head_dim;
     hp.kv_dim = hp.n_head_kv * hp.head_dim;
-    hp.n_expert = get_i("inkling2.expert_count", 128);
-    hp.n_expert_used = get_i("inkling2.expert_used_count", 8);
-    hp.n_rel = get_i("inkling2.attention.relative_length", 16);
-    hp.n_rel_ext = get_i("inkling2.attention.relative_extent", 1024);
-    hp.n_swa = get_i("inkling2.attention.sliding_window", 1024);
-    hp.attn_res_block_size = get_i("inkling2.attn_res.block_size", 6);
-    hp.n_conv = get_i("inkling2.shortconv.l_cache", 4);
-    hp.loop_gate_rank = get_i("inkling2.loop.gate_rank", 64);
-    hp.vocab_padded = get_i("inkling2.vocab_size", 201024);
-    hp.vocab_unpadded = get_i("inkling2.vocab_size_unpadded", 200058);
-    hp.log_scale_floor = get_i("inkling2.attention.log_scale_floor", 8192);
-    hp.log_scale_alpha = get_f("inkling2.attention.log_scale_alpha", 0.1f);
-    hp.rms_eps = get_f("inkling2.attention.layer_norm_rms_epsilon", 1e-6f);
-    hp.qk_clip = get_f("inkling2.attention.qk_clip", 22.6274166f);
-    hp.rel_clip = get_f("inkling2.attention.relative_clip", 8.0f);
-    hp.situ_beta = get_f("inkling2.activation.situ_beta", 4.0f);
-    hp.situ_linear_beta = get_f("inkling2.activation.situ_linear_beta", 25.0f);
-    hp.expert_weights_scale = get_f("inkling2.expert_weights_scale", 8.0f);
-    hp.softcap = get_f("inkling2.final_logit_softcapping", 30.0f);
-    if (const auto* v = meta.get("inkling2.attention.sliding_window_pattern")) {
-        hp.swa_pattern.resize(v->items.size());
-        for (size_t i = 0; i < v->items.size(); ++i) hp.swa_pattern[i] = v->items[i].u ? 1 : 0;
+    hp.n_expert = get_i("expert_count", 128);
+    hp.n_expert_used = get_i("expert_used_count", 8);
+    hp.n_rel = get_i("attention.relative_length", 16);
+    hp.n_rel_ext = get_i("attention.relative_extent", 1024);
+    hp.n_swa = get_i("attention.sliding_window", 1024);
+    hp.attn_res_block_size = get_i("attn_res.block_size", 6);
+    hp.n_conv = get_i("shortconv.l_cache", 4);
+    hp.loop_gate_rank = get_i("loop.gate_rank", 64);
+    hp.vocab_padded = get_i("vocab_size", 201024);
+    hp.vocab_unpadded = get_i("vocab_size_unpadded", 200058);
+    hp.log_scale_floor = get_i("attention.log_scale_floor", 8192);
+    hp.log_scale_alpha = get_f("attention.log_scale_alpha", 0.1f);
+    hp.rms_eps = get_f("attention.layer_norm_rms_epsilon", 1e-6f);
+    hp.qk_clip = get_f("attention.qk_clip", 22.6274166f);
+    hp.rel_clip = get_f("attention.relative_clip", 8.0f);
+    hp.situ_beta = get_f("activation.situ_beta", 4.0f);
+    hp.situ_linear_beta = get_f("activation.situ_linear_beta", 25.0f);
+    hp.expert_weights_scale = get_f("expert_weights_scale", 8.0f);
+    hp.softcap = get_f("final_logit_softcapping", 30.0f);
+    if (const auto* v = meta.get(pfx + "attention.sliding_window_pattern")) {
+        if ((int64_t) v->items.size() == hp.n_phys && hp.n_layer > hp.n_phys) {
+            hp.swa_pattern.resize((size_t) hp.n_layer);
+            for (int64_t il = 0; il < hp.n_layer; ++il) {
+                int ip = hp.loop_layer((int) il);
+                hp.swa_pattern[(size_t) il] = v->items[(size_t) ip].u ? 1 : 0;
+            }
+        } else {
+            hp.swa_pattern.resize(v->items.size());
+            for (size_t i = 0; i < v->items.size(); ++i) hp.swa_pattern[i] = v->items[i].u ? 1 : 0;
+        }
     }
 
     // Global tensors (token_embd kept in host mmap)
@@ -706,8 +728,39 @@ bool load_model(const std::string& path, Model& m, std::string& err, int peer_de
     }
     m.tok_embd_norm = m.upload_f32("token_embd_norm.weight", (size_t) hp.n_embd);
     if (hp.num_loops > 1) {
-        m.loop_res_query = m.upload_f32("loop_res_query.weight", (size_t) hp.n_embd * 2 * n_core);
-        m.loop_kv_res_query = m.upload_f32("loop_kv_res_query.weight", (size_t) hp.n_embd * 2 * n_core);
+        if (m.find_tensor("loop_res_query.weight")) {
+            m.loop_res_query = m.upload_f32("loop_res_query.weight", (size_t) hp.n_embd * 2 * n_core);
+            m.loop_kv_res_query = m.upload_f32("loop_kv_res_query.weight", (size_t) hp.n_embd * 2 * n_core);
+        } else {
+            // llama.cpp inkling2_loop format: blk.<ip>.loop_msg_query.weight [n_embd, 4] = [q, k, v, ffn]
+            const size_t N = (size_t) hp.n_embd;
+            const size_t tot = N * 2 * (size_t) n_core;
+            std::vector<float> h_res(tot, 0.0f), h_kv(tot, 0.0f);
+            for (int64_t c = 0; c < n_core; ++c) {
+                const int64_t ip = hp.core_start + c;
+                const std::string tname = "blk." + std::to_string(ip) + ".loop_msg_query.weight";
+                const strata::TensorInfo* ti = nullptr;
+                const uint8_t* raw = m.find_tensor(tname.c_str(), &ti);
+                if (!raw || !ti || ti->type != 0) {
+                    err = "missing or non-F32 " + tname;
+                    return false;
+                }
+                const float* src = (const float*) raw;
+                std::memcpy(h_res.data() + (2 * (size_t) c + 0) * N, src + 0 * N, N * sizeof(float)); // q
+                std::memcpy(h_kv.data()  + (2 * (size_t) c + 0) * N, src + 1 * N, N * sizeof(float)); // k
+                std::memcpy(h_kv.data()  + (2 * (size_t) c + 1) * N, src + 2 * N, N * sizeof(float)); // v
+                std::memcpy(h_res.data() + (2 * (size_t) c + 1) * N, src + 3 * N, N * sizeof(float)); // ffn
+            }
+            float* d_res = nullptr; float* d_kv = nullptr;
+            CK(cudaMalloc(&d_res, tot * sizeof(float)));
+            CK(cudaMalloc(&d_kv, tot * sizeof(float)));
+            CK(cudaMemcpy(d_res, h_res.data(), tot * sizeof(float), cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(d_kv, h_kv.data(), tot * sizeof(float), cudaMemcpyHostToDevice));
+            m.gpu_allocs.push_back(d_res);
+            m.gpu_allocs.push_back(d_kv);
+            m.loop_res_query = d_res;
+            m.loop_kv_res_query = d_kv;
+        }
     }
     m.output_res_query = m.upload_f32("output_res_query.weight", (size_t) hp.n_embd);
     m.output_norm = m.upload_f32("output_norm.weight", (size_t) hp.n_embd);
@@ -957,12 +1010,20 @@ bool load_model(const std::string& path, Model& m, std::string& err, int peer_de
         }
 
         if (L.has_loop) {
-            static const char* mods[4] = {"attn", "k", "v", "mlp"};
+            static const char* mods_old[4] = {"attn", "k", "v", "mlp"};
+            static const char* mods_new[4] = {"q", "k", "v", "ffn"};
+            const bool use_new_ctrl = (m.find_tensor(tn("loop_q_ctrl_down.weight")) != nullptr);
             for (int j = 0; j < 4; ++j) {
                 char s0[64], s1[64], s2[64];
-                std::snprintf(s0, sizeof s0, "loop_%s_down.weight", mods[j]);
-                std::snprintf(s1, sizeof s1, "loop_%s_gain.weight", mods[j]);
-                std::snprintf(s2, sizeof s2, "loop_%s_forget.weight", mods[j]);
+                if (use_new_ctrl) {
+                    std::snprintf(s0, sizeof s0, "loop_%s_ctrl_down.weight", mods_new[j]);
+                    std::snprintf(s1, sizeof s1, "loop_%s_ctrl_gain.weight", mods_new[j]);
+                    std::snprintf(s2, sizeof s2, "loop_%s_ctrl_forget.weight", mods_new[j]);
+                } else {
+                    std::snprintf(s0, sizeof s0, "loop_%s_down.weight", mods_old[j]);
+                    std::snprintf(s1, sizeof s1, "loop_%s_gain.weight", mods_old[j]);
+                    std::snprintf(s2, sizeof s2, "loop_%s_forget.weight", mods_old[j]);
+                }
                 auto upload_f16_ctrl = [&](const char* name) -> DenseMat {
                     DenseMat dm = m.upload_dense(name);
                     if (dm.type == 0 && dm.d && (std::getenv("STRATA_NO_CTRL_F16") == nullptr)) {
@@ -1813,13 +1874,17 @@ struct Engine {
 
     StateCheckpoint save_checkpoint(const std::vector<int32_t>& tokens) {
         const auto& hp = m->hp;
+        const bool tp = peer.tp_attn;
+        const size_t kv_d = (size_t) (tp ? (hp.kv_dim / 2) : hp.kv_dim);
+        const size_t nh_kv = (size_t) (tp ? (hp.n_head_kv / 2) : hp.n_head_kv);
         const size_t conv_bytes = (size_t) hp.n_layer * layer_conv_floats * sizeof(float);
-        size_t total = conv_bytes;
+        const size_t peer_conv_bytes = tp ? ((size_t) hp.n_layer * peer.conv_floats_layer * sizeof(float)) : 0;
+        size_t total = conv_bytes + peer_conv_bytes;
         for (int il = 0; il < hp.n_layer; ++il) {
             if (!hp.is_swa(il)) continue;
             const size_t cap = (size_t) kv_cap[(size_t) il];
-            if (kv_q8) total += cap * (size_t) hp.kv_dim * 2 + cap * (size_t) hp.n_head_kv * sizeof(__half) * 2;
-            else total += cap * (size_t) hp.kv_dim * sizeof(__half) * 2;
+            if (kv_q8) total += (tp ? 2 : 1) * (cap * kv_d * 2 + cap * nh_kv * sizeof(__half) * 2);
+            else total += cap * kv_d * sizeof(__half) * 2;
         }
         StateCheckpoint cp;
         cp.tokens = tokens;
@@ -1833,23 +1898,39 @@ struct Engine {
         }
         uint8_t* dst_base = ckpt_pin ? ckpt_pin : cp.data.data();
         size_t off = 0;
-        auto pull = [&](const void* src, size_t n) {
-            CK(cudaMemcpyAsync(dst_base + off, src, n, cudaMemcpyDeviceToHost, st));
+        auto pull = [&](const void* src, size_t n, cudaStream_t stream) {
+            CK(cudaMemcpyAsync(dst_base + off, src, n, cudaMemcpyDeviceToHost, stream));
             off += n;
         };
-        pull(conv_hist_pool, conv_bytes);
+        pull(conv_hist_pool, conv_bytes, st);
         for (int il = 0; il < hp.n_layer; ++il) {
             if (!hp.is_swa(il)) continue;
             const size_t cap = (size_t) kv_cap[(size_t) il];
             if (kv_q8) {
-                pull(kq[(size_t) il], cap * (size_t) hp.kv_dim);
-                pull(vq[(size_t) il], cap * (size_t) hp.kv_dim);
-                pull(ks[(size_t) il], cap * (size_t) hp.n_head_kv * sizeof(__half));
-                pull(vs[(size_t) il], cap * (size_t) hp.n_head_kv * sizeof(__half));
+                pull(kq[(size_t) il], cap * kv_d, st);
+                pull(vq[(size_t) il], cap * kv_d, st);
+                pull(ks[(size_t) il], cap * nh_kv * sizeof(__half), st);
+                pull(vs[(size_t) il], cap * nh_kv * sizeof(__half), st);
             } else {
-                pull(kc[(size_t) il], cap * (size_t) hp.kv_dim * sizeof(__half));
-                pull(vc[(size_t) il], cap * (size_t) hp.kv_dim * sizeof(__half));
+                pull(kc[(size_t) il], cap * kv_d * sizeof(__half), st);
+                pull(vc[(size_t) il], cap * kv_d * sizeof(__half), st);
             }
+        }
+        if (tp) {
+            CK(cudaSetDevice(peer.dev));
+            pull(peer.conv_hist_pool, peer_conv_bytes, peer.st);
+            for (int il = 0; il < hp.n_layer; ++il) {
+                if (!hp.is_swa(il)) continue;
+                const size_t cap = (size_t) kv_cap[(size_t) il];
+                if (kv_q8) {
+                    pull(peer.kq[(size_t) il], cap * kv_d, peer.st);
+                    pull(peer.vq[(size_t) il], cap * kv_d, peer.st);
+                    pull(peer.ks[(size_t) il], cap * nh_kv * sizeof(__half), peer.st);
+                    pull(peer.vs[(size_t) il], cap * nh_kv * sizeof(__half), peer.st);
+                }
+            }
+            CK(cudaStreamSynchronize(peer.st));
+            CK(cudaSetDevice(peer.primary_dev));
         }
         if (dspark) {
             cp.dspark_data.resize(ds_bytes);
@@ -1865,25 +1946,45 @@ struct Engine {
 
     void restore_checkpoint(const StateCheckpoint& cp) {
         const auto& hp = m->hp;
+        const bool tp = peer.tp_attn;
+        const size_t kv_d = (size_t) (tp ? (hp.kv_dim / 2) : hp.kv_dim);
+        const size_t nh_kv = (size_t) (tp ? (hp.n_head_kv / 2) : hp.n_head_kv);
         const size_t conv_bytes = (size_t) hp.n_layer * layer_conv_floats * sizeof(float);
+        const size_t peer_conv_bytes = tp ? ((size_t) hp.n_layer * peer.conv_floats_layer * sizeof(float)) : 0;
         size_t off = 0;
-        auto push = [&](void* dst, size_t n) {
-            CK(cudaMemcpyAsync(dst, cp.data.data() + off, n, cudaMemcpyHostToDevice, st));
+        auto push = [&](void* dst, size_t n, cudaStream_t stream) {
+            CK(cudaMemcpyAsync(dst, cp.data.data() + off, n, cudaMemcpyHostToDevice, stream));
             off += n;
         };
-        push(conv_hist_pool, conv_bytes);
+        push(conv_hist_pool, conv_bytes, st);
         for (int il = 0; il < hp.n_layer; ++il) {
             if (!hp.is_swa(il)) continue;
             const size_t cap = (size_t) kv_cap[(size_t) il];
             if (kv_q8) {
-                push(kq[(size_t) il], cap * (size_t) hp.kv_dim);
-                push(vq[(size_t) il], cap * (size_t) hp.kv_dim);
-                push(ks[(size_t) il], cap * (size_t) hp.n_head_kv * sizeof(__half));
-                push(vs[(size_t) il], cap * (size_t) hp.n_head_kv * sizeof(__half));
+                push(kq[(size_t) il], cap * kv_d, st);
+                push(vq[(size_t) il], cap * kv_d, st);
+                push(ks[(size_t) il], cap * nh_kv * sizeof(__half), st);
+                push(vs[(size_t) il], cap * nh_kv * sizeof(__half), st);
             } else {
-                push(kc[(size_t) il], cap * (size_t) hp.kv_dim * sizeof(__half));
-                push(vc[(size_t) il], cap * (size_t) hp.kv_dim * sizeof(__half));
+                push(kc[(size_t) il], cap * kv_d * sizeof(__half), st);
+                push(vc[(size_t) il], cap * kv_d * sizeof(__half), st);
             }
+        }
+        if (tp) {
+            CK(cudaSetDevice(peer.dev));
+            push(peer.conv_hist_pool, peer_conv_bytes, peer.st);
+            for (int il = 0; il < hp.n_layer; ++il) {
+                if (!hp.is_swa(il)) continue;
+                const size_t cap = (size_t) kv_cap[(size_t) il];
+                if (kv_q8) {
+                    push(peer.kq[(size_t) il], cap * kv_d, peer.st);
+                    push(peer.vq[(size_t) il], cap * kv_d, peer.st);
+                    push(peer.ks[(size_t) il], cap * nh_kv * sizeof(__half), peer.st);
+                    push(peer.vs[(size_t) il], cap * nh_kv * sizeof(__half), peer.st);
+                }
+            }
+            CK(cudaStreamSynchronize(peer.st));
+            CK(cudaSetDevice(peer.primary_dev));
         }
         pos = (int64_t) cp.tokens.size();
         if (dspark && !cp.dspark_data.empty()) {

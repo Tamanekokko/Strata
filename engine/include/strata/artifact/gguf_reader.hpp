@@ -847,15 +847,18 @@ inline std::string geometry_unsupported(const core::ModelGeometry& g) {
 /// (qwen4exp) is read and checked against the shape the kernels are compiled for; Qwen3.6-35B-A3B (qwen35moe) must
 /// carry every key its geometry is read from (core::geometry_from_gguf).
 inline std::string check_architecture_inkling2(const GgufFile& g) {
+    const MetaValue* arch = g.get("general.architecture");
+    const std::string pfx = (arch && !arch->s.empty()) ? (arch->s + ".") : std::string("inkling2.");
     static const char* const keys[] = {
-        "inkling2.block_count", "inkling2.embedding_length", "inkling2.attention.head_count",
-        "inkling2.attention.head_count_kv", "inkling2.attention.key_length", "inkling2.attention.value_length",
-        "inkling2.expert_count", "inkling2.expert_used_count", "inkling2.expert_feed_forward_length",
-        "inkling2.vocab_size", "inkling2.vocab_size_unpadded",
+        "block_count", "embedding_length", "attention.head_count",
+        "attention.head_count_kv", "attention.key_length", "attention.value_length",
+        "expert_count", "expert_used_count", "expert_feed_forward_length",
+        "vocab_size", "vocab_size_unpadded",
     };
     for (const char* k : keys) {
-        const MetaValue* v = g.get(k);
-        if (!v) return std::string("missing ") + k;
+        const std::string full = pfx + k;
+        const MetaValue* v = g.get(full);
+        if (!v) return std::string("missing ") + full;
     }
     return {};
 }
