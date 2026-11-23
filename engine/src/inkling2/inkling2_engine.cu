@@ -422,6 +422,95 @@ struct PhysLayer {
     std::vector<int32_t> peer_slot_of;   // [n_expert] on host
 };
 
+
+struct QsaIndexerLayerDev {
+    uint16_t* w_q = nullptr;      // [h_idx * d_idx, n_embd] FP16 (512 x 2304)
+    uint16_t* w_k = nullptr;      // [d_idx, n_embd] FP16 (128 x 2304)
+    float*    q_norm_w = nullptr; // [d_idx]
+    float*    k_norm_w = nullptr; // [d_idx]
+    float*    w_head = nullptr;   // [h_idx]
+};
+
+struct QsaIndexerWeights {
+    bool loaded = false;
+    int n_full = 0;
+    int n_embd = 0;
+    int h_idx = 4;
+    int d_idx = 128;
+    int compress_ratio = 4;
+    float rope_theta = 1000000.0f;
+    int budget_tokens = 2048;
+    int local_tokens = 256;
+    int sink_tokens = 16;
+    std::vector<int> full_vls;
+    std::vector<QsaIndexerLayerDev> dev0;
+    std::vector<QsaIndexerLayerDev> dev1; // replica on peer_dev for zero-P2P local scoring
+
+    int full_idx(int il) const {
+        for (int f = 0; f < n_full; ++f) if (full_vls[(size_t) f] == il) return f;
+        return -1;
+    }
+
+    bool load_file(const std::string& path, int primary_dev, int peer_dev, std::string& err) {
+        FILE* fp = std::fopen(path.c_str(), "rb");
+        if (!fp) { err = "cannot open QSA indexer: " + path; return false; }
+        int32_t hdr[7] = {};
+        float theta = 1000000.0f;
+        if (std::fread(hdr, sizeof(int32_t), 7, fp) != 7 || std::fread(&theta, sizeof(float), 1, fp) != 1) {
+            std::fclose(fp); err = "short header in QSA indexer"; return false;
+        }
+        if ((uint32_t) hdr[0] != 0x51534157u) {
+            std::fclose(fp); err = "bad magic in QSA indexer"; return false;
+        }
+        n_full = hdr[2]; n_embd = hdr[3]; h_idx = hdr[4]; d_idx = hdr[5]; compress_ratio = hdr[6];
+        rope_theta = theta;
+        full_vls.resize((size_t) n_full);
+        if (std::fread(full_vls.data(), sizeof(int32_t), (size_t) n_full, fp) != (size_t) n_full) {
+            std::fclose(fp); err = "short full_vls in QSA indexer"; return false;
+        }
+        const size_t wq_n = (size_t) h_idx * d_idx * n_embd;
+        const size_t wk_n = (size_t) d_idx * n_embd;
+        std::vector<uint16_t> h_wq(wq_n), h_wk(wk_n);
+        std::vector<float> h_qn((size_t) d_idx), h_kn((size_t) d_idx), h_wh((size_t) h_idx);
+
+        dev0.resize((size_t) n_full);
+        if (peer_dev >= 0 && peer_dev != primary_dev) dev1.resize((size_t) n_full);
+
+        auto upload_one = [&](int dev, QsaIndexerLayerDev& L) {
+            CK(cudaSetDevice(dev));
+            CK(cudaMalloc(&L.w_q, wq_n * sizeof(uint16_t)));
+            CK(cudaMalloc(&L.w_k, wk_n * sizeof(uint16_t)));
+            CK(cudaMalloc(&L.q_norm_w, (size_t) d_idx * sizeof(float)));
+            CK(cudaMalloc(&L.k_norm_w, (size_t) d_idx * sizeof(float)));
+            CK(cudaMalloc(&L.w_head, (size_t) h_idx * sizeof(float)));
+            CK(cudaMemcpy(L.w_q, h_wq.data(), wq_n * sizeof(uint16_t), cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(L.w_k, h_wk.data(), wk_n * sizeof(uint16_t), cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(L.q_norm_w, h_qn.data(), (size_t) d_idx * sizeof(float), cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(L.k_norm_w, h_kn.data(), (size_t) d_idx * sizeof(float), cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(L.w_head, h_wh.data(), (size_t) h_idx * sizeof(float), cudaMemcpyHostToDevice));
+        };
+
+        for (int f = 0; f < n_full; ++f) {
+            if (std::fread(h_wq.data(), sizeof(uint16_t), wq_n, fp) != wq_n ||
+                std::fread(h_wk.data(), sizeof(uint16_t), wk_n, fp) != wk_n ||
+                std::fread(h_qn.data(), sizeof(float), (size_t) d_idx, fp) != (size_t) d_idx ||
+                std::fread(h_kn.data(), sizeof(float), (size_t) d_idx, fp) != (size_t) d_idx ||
+                std::fread(h_wh.data(), sizeof(float), (size_t) h_idx, fp) != (size_t) h_idx) {
+                std::fclose(fp); err = "truncated QSA indexer weights"; return false;
+            }
+            upload_one(primary_dev, dev0[(size_t) f]);
+            if (!dev1.empty()) upload_one(peer_dev, dev1[(size_t) f]);
+        }
+        CK(cudaSetDevice(primary_dev));
+        std::fclose(fp);
+        loaded = true;
+        std::fprintf(stderr, "strata-inkling2: loaded QSA indexer (%d full-attn layers, budget=%d, local=%d, sink=%d, theta=%.0f)%s\n",
+                     n_full, budget_tokens, local_tokens, sink_tokens, rope_theta,
+                     !dev1.empty() ? " [replicated GPU0+GPU1]" : "");
+        return true;
+    }
+};
+
 struct Model : GpuWeightStore {
     std::unique_ptr<strata::GgufModel> gguf;
     Hparams hp;
@@ -440,6 +529,7 @@ struct Model : GpuWeightStore {
     int64_t vocab_tp1 = 0;
     int tp_peer_dev = -1;
     bool tp_attn = false;
+    QsaIndexerWeights qsa;
     bool tp_moe = false;
 
     std::vector<PhysLayer> layers;
@@ -1130,6 +1220,194 @@ struct Engine {
     size_t vram_free_after_place = 0;
     int pool_workers = 0;
 
+
+
+    struct QsaRunState {
+        bool active = false;
+        int n_full = 0;
+        int max_blocks = 0;
+        int max_groups = 0;
+        int K_blocks = 512;
+        std::vector<__half*> k_comp;     // [n_full] each [max_blocks, 128] FP16
+        std::vector<float*>  k_tail;     // [n_full] each [4, n_embd] FP32
+        __half* d_kmean = nullptr;       // [max_T/4, n_embd] FP16
+        float*  d_kraw = nullptr;        // [max_T/4, 128] FP32
+        float*  d_qraw = nullptr;        // [max_T, 512] FP32
+        float*  d_qidx = nullptr;        // [max_T, 512] FP32
+        float*  d_scores = nullptr;      // [max_groups, max_blocks] FP32
+        int32_t* d_sel = nullptr;        // [max_groups, K_blocks] int32
+
+        void init(int dev, const QsaIndexerWeights& qsa, int max_ctx, int max_T) {
+            if (!qsa.loaded) return;
+            CK(cudaSetDevice(dev));
+            active = true;
+            n_full = qsa.n_full;
+            max_blocks = (max_ctx + 3) / 4 + 4;
+            max_groups = (max_T + 15) / 16 + 1;
+            K_blocks = std::max(16, qsa.budget_tokens / 4);
+            k_comp.assign((size_t) n_full, nullptr);
+            k_tail.assign((size_t) n_full, nullptr);
+            for (int f = 0; f < n_full; ++f) {
+                CK(cudaMalloc(&k_comp[(size_t) f], (size_t) max_blocks * 128 * sizeof(__half)));
+                CK(cudaMalloc(&k_tail[(size_t) f], (size_t) 4 * qsa.n_embd * sizeof(float)));
+            }
+            CK(cudaMalloc(&d_kmean, (size_t) ((max_T + 3) / 4 + 1) * qsa.n_embd * sizeof(__half)));
+            CK(cudaMalloc(&d_kraw,  (size_t) ((max_T + 3) / 4 + 1) * 128 * sizeof(float)));
+            CK(cudaMalloc(&d_qraw,  (size_t) max_T * 512 * sizeof(float)));
+            CK(cudaMalloc(&d_qidx,  (size_t) max_T * 512 * sizeof(float)));
+            CK(cudaMalloc(&d_scores,(size_t) max_groups * max_blocks * sizeof(float)));
+            CK(cudaMalloc(&d_sel,   (size_t) max_groups * K_blocks * sizeof(int32_t)));
+        }
+    };
+    QsaRunState qsa_st0;
+    QsaRunState qsa_st1;
+
+    // Run QSA Indexer key update + scoring + top-K selection for one Full-Attention virtual layer
+    void run_qsa_indexer(cudaStream_t rst, strata::prefill::Gemm& rgemm, QsaRunState& qs,
+                         const std::vector<QsaIndexerLayerDev>& qdev,
+                         int il, const float* r_inq, const float* r_ink,
+                         const uint16_t* r_f16q, uint16_t* r_f16_scr,
+                         const int32_t* r_pos0, int T, int p0_host, bool& use_qsa_sparse) {
+        use_qsa_sparse = false;
+        if (!qs.active) return;
+        const int fidx = m->qsa.full_idx(il);
+        if (fidx < 0) return;
+        const auto& QL = qdev[(size_t) fidx];
+        const int N = (int) m->hp.n_embd;
+        const int K_blk = qs.K_blocks;
+        const int sink_blk = std::max(0, m->qsa.sink_tokens / 4);
+        const int local_blk = std::max(0, m->qsa.local_tokens / 4);
+
+        if (T == 1) {
+            k_qsa_k_update_t1<<<1, 128, 0, rst>>>(
+                r_ink, qs.k_tail[(size_t) fidx], (const __half*) QL.w_k, QL.k_norm_w,
+                qs.k_comp[(size_t) fidx], r_pos0, N, m->qsa.rope_theta);
+            if (p0_host >= m->qsa.budget_tokens) {
+                k_qsa_q_proj_norm_rope_t1<<<4, 128, 0, rst>>>(
+                    r_inq, (const __half*) QL.w_q, QL.q_norm_w, qs.d_qidx,
+                    r_pos0, N, m->qsa.rope_theta);
+                const int n_blk_est = (p0_host + 1) >> 2;
+                const int max_blk_launch = std::min(qs.max_blocks, n_blk_est + 64);
+                k_qsa_score_groups<<<dim3((unsigned) ((max_blk_launch + 3) / 4), 1), 128, 0, rst>>>(
+                    qs.d_qidx, qs.k_comp[(size_t) fidx], QL.w_head, qs.d_scores,
+                    r_pos0, 1, qs.max_blocks, sink_blk, local_blk);
+                k_qsa_select_topk<<<1, 256, 0, rst>>>(
+                    qs.d_scores, qs.d_sel, r_pos0, 1, qs.max_blocks, K_blk);
+                use_qsa_sparse = true;
+            }
+        } else {
+            if ((p0_host & 3) == 0 && (T >= 4)) {
+                const int n_tb = T >> 2;
+                k_qsa_mean4_f32_to_f16<<<(unsigned) n_tb, 256, 0, rst>>>(r_ink, qs.d_kmean, n_tb, N);
+                rgemm.f16((const uint16_t*) qs.d_kmean, QL.w_k, qs.d_kraw, n_tb, m->qsa.d_idx, N);
+                k_qsa_k_norm_rope<<<(unsigned) n_tb, 128, 0, rst>>>(
+                    qs.d_kraw, QL.k_norm_w, qs.k_comp[(size_t) fidx], p0_host >> 2, n_tb, m->qsa.rope_theta);
+                const int rem = T & 3;
+                if (rem > 0) {
+                    CK(cudaMemcpyAsync(qs.k_tail[(size_t) fidx], r_ink + (size_t) (n_tb * 4) * N,
+                                       (size_t) rem * N * sizeof(float), cudaMemcpyDeviceToDevice, rst));
+                }
+            }
+            static const bool qsa_decode_only = (std::getenv("STRATA_QSA_DECODE_ONLY") != nullptr);
+            if (!qsa_decode_only && p0_host + T > m->qsa.budget_tokens) {
+                const uint16_t* q_in16 = r_f16q;
+                if (!q_in16) {
+                    const int64_t tot = (int64_t) T * N;
+                    k_f32_to_f16<<<(unsigned) ((tot + 255) / 256), 256, 0, rst>>>(r_inq, r_f16_scr, tot);
+                    q_in16 = r_f16_scr;
+                }
+                rgemm.f16(q_in16, QL.w_q, qs.d_qraw, T, m->qsa.h_idx * m->qsa.d_idx, N);
+                k_qsa_q_norm_rope<<<dim3((unsigned) T, (unsigned) m->qsa.h_idx), 128, 0, rst>>>(
+                    qs.d_qraw, QL.q_norm_w, qs.d_qidx, r_pos0, T, m->qsa.rope_theta);
+                const int G = (T + 15) / 16;
+                const int n_blk_max = (p0_host + T + 1) >> 2;
+                k_qsa_score_groups<<<dim3((unsigned) ((n_blk_max + 3) / 4), (unsigned) G), 128, 0, rst>>>(
+                    qs.d_qidx, qs.k_comp[(size_t) fidx], QL.w_head, qs.d_scores,
+                    r_pos0, T, qs.max_blocks, sink_blk, local_blk);
+                k_qsa_select_topk<<<(unsigned) G, 256, 0, rst>>>(
+                    qs.d_scores, qs.d_sel, r_pos0, T, qs.max_blocks, K_blk);
+                use_qsa_sparse = true;
+            }
+        }
+    }
+
+    // QSA teacher data collector (for distilling 8 Full-Attention layer indexers)
+    struct QsaTeacherCollector {
+        bool active = false;
+        int n_full = 8;
+        int max_blocks = 4096;
+        int n_embd = 2304;
+        std::vector<int> full_vls;
+        std::vector<std::vector<uint16_t>> k_mean_h;
+        std::vector<std::vector<uint16_t>> q_feat_h;
+        std::vector<std::vector<int32_t>>  q_pos_h;
+        std::vector<std::vector<uint16_t>> p_tgt_h;
+        __half* d_kmean = nullptr;
+        __half* d_qfeat = nullptr;
+        int32_t* d_qrows = nullptr;
+        float* d_p_f32 = nullptr;
+        __half* d_p_f16 = nullptr;
+        int cap_m = 256;
+        int cap_tb = 512;
+
+        void init(const Hparams& hp, int seq_len) {
+            active = true;
+            n_embd = (int) hp.n_embd;
+            max_blocks = seq_len / 4;
+            full_vls.clear();
+            for (int il = 0; il < (int) hp.n_layer; ++il) {
+                if (!hp.is_swa(il)) full_vls.push_back(il);
+            }
+            n_full = (int) full_vls.size();
+            k_mean_h.assign((size_t) n_full, {});
+            q_feat_h.assign((size_t) n_full, {});
+            q_pos_h.assign((size_t) n_full, {});
+            p_tgt_h.assign((size_t) n_full, {});
+            if (!d_kmean) {
+                CK(cudaMalloc(&d_kmean, (size_t) cap_tb * n_embd * sizeof(__half)));
+                CK(cudaMalloc(&d_qfeat, (size_t) cap_m * n_embd * sizeof(__half)));
+                CK(cudaMalloc(&d_qrows, (size_t) cap_m * sizeof(int32_t)));
+                CK(cudaMalloc(&d_p_f32, (size_t) cap_m * max_blocks * sizeof(float)));
+                CK(cudaMalloc(&d_p_f16, (size_t) cap_m * max_blocks * sizeof(__half)));
+            }
+        }
+        void clear_seq() {
+            for (int f = 0; f < n_full; ++f) {
+                k_mean_h[(size_t) f].clear();
+                q_feat_h[(size_t) f].clear();
+                q_pos_h[(size_t) f].clear();
+                p_tgt_h[(size_t) f].clear();
+            }
+        }
+        int full_idx(int il) const {
+            for (int f = 0; f < n_full; ++f) if (full_vls[(size_t) f] == il) return f;
+            return -1;
+        }
+        void save(const std::string& path) const {
+            FILE* fp = std::fopen(path.c_str(), "wb");
+            if (!fp) { std::fprintf(stderr, "qsa_teacher: cannot open %s\n", path.c_str()); return; }
+            const uint32_t magic = 0x51534154u;
+            const uint32_t version = 1;
+            const int32_t hdr[6] = {(int32_t) magic, (int32_t) version, n_full, n_embd, max_blocks,
+                                    (int32_t) (n_full > 0 ? q_pos_h[0].size() : 0)};
+            std::fwrite(hdr, sizeof(int32_t), 6, fp);
+            std::fwrite(full_vls.data(), sizeof(int32_t), (size_t) n_full, fp);
+            for (int f = 0; f < n_full; ++f) {
+                const int32_t nb = (int32_t) (k_mean_h[(size_t) f].size() / (size_t) n_embd);
+                const int32_t nq = (int32_t) q_pos_h[(size_t) f].size();
+                std::fwrite(&nb, sizeof(int32_t), 1, fp);
+                std::fwrite(&nq, sizeof(int32_t), 1, fp);
+                std::fwrite(k_mean_h[(size_t) f].data(), sizeof(uint16_t), k_mean_h[(size_t) f].size(), fp);
+                std::fwrite(q_pos_h[(size_t) f].data(), sizeof(int32_t), q_pos_h[(size_t) f].size(), fp);
+                std::fwrite(q_feat_h[(size_t) f].data(), sizeof(uint16_t), q_feat_h[(size_t) f].size(), fp);
+                std::fwrite(p_tgt_h[(size_t) f].data(), sizeof(uint16_t), p_tgt_h[(size_t) f].size(), fp);
+            }
+            std::fclose(fp);
+        }
+    };
+    QsaTeacherCollector qsa_teacher;
+
+
     bool prof = false;
     bool prof_detail = false;
     double p_embd_ms = 0, p_attn_ms = 0, p_moe_gpu_ms = 0, p_moe_wait_ms = 0, p_moe_cpu_ms = 0;
@@ -1779,6 +2057,7 @@ struct Engine {
         (void) cudaFuncSetAttribute((const void*) k_attn_q8_gqa3_pp_wmma_gqa3, cudaFuncAttributeMaxDynamicSharedMemorySize, 49152);
         (void) cudaFuncSetAttribute((const void*) k_attn_q8_gqa3_pp_wmma_t32, cudaFuncAttributeMaxDynamicSharedMemorySize, 49152);
         (void) cudaFuncSetAttribute((const void*) k_attn_q8_gqa3_pp_wmma, cudaFuncAttributeMaxDynamicSharedMemorySize, 29184);
+        (void) cudaFuncSetAttribute((const void*) k_attn_q8_gqa3_qsa_pp_wmma, cudaFuncAttributeMaxDynamicSharedMemorySize, 29696);
         (void) cudaGetLastError();
 #else
         // Gate high-SMEM FA2 kernels on cudaDevAttrMaxSharedMemoryPerBlockOptin so Turing (sm_75, 64 KB cap) cleanly falls back to pp_wmma (29 KB).
@@ -1803,7 +2082,17 @@ struct Engine {
         try_set_smem((const void*) k_attn_q8_gqa3_pp_wmma_gqa3, 49152);
         try_set_smem((const void*) k_attn_q8_gqa3_pp_wmma_t32, 49152);
         try_set_smem((const void*) k_attn_q8_gqa3_pp_wmma, 29184);
+        try_set_smem((const void*) k_attn_q8_gqa3_qsa_pp_wmma, 29696);
 #endif
+        if (m->qsa.loaded) {
+            int cur_dev_q = 0;
+            CK(cudaGetDevice(&cur_dev_q));
+            qsa_st0.init(cur_dev_q, m->qsa, (int) max_ctx, (int) tmax);
+            if (m->tp_peer_dev >= 0 && !m->qsa.dev1.empty()) {
+                qsa_st1.init(m->tp_peer_dev, m->qsa, (int) max_ctx, (int) tmax);
+                CK(cudaSetDevice(cur_dev_q));
+            }
+        }
 
         const int64_t max_ent = (int64_t) tmax * hp.n_expert_used;
         d_f32(&router_logits, (size_t) tmax * hp.n_expert);
@@ -3792,16 +4081,34 @@ struct Engine {
                     const float kq_scale = 1.0f / std::sqrt((float) hp.head_dim);
                     const void* att_xq_r = nullptr;
                     const int sp_cap = std::max(1, attn_split_slots / std::max(1, T));
+                    bool use_qsa_sparse = false;
+                    QsaRunState& rqs = is_primary ? qsa_st0 : qsa_st1;
+                    const auto& rqdev = is_primary ? m->qsa.dev0 : m->qsa.dev1;
+                    if (!is_swa && rqs.active) {
+                        run_qsa_indexer(rst, rgemm, rqs, rqdev, il, r_inq, r_ink, r_f16q, r_f16_scr, r_pos0, T, (int) pos, use_qsa_sparse);
+                    }
                     if (T < 16) {
                         const int sp = std::min(sp_cap, (T == 1)
-                            ? (is_swa ? std::max(attn_split_t1_swa, 16) : attn_split_t1_full)
+                            ? (is_swa ? std::max(attn_split_t1_swa, 16) : (use_qsa_sparse ? std::min(attn_split_t1_full, 16) : attn_split_t1_full))
                             : (is_swa ? 8 : 32));
-                        k_attn_q8_gqa3_split<<<dim3((unsigned) nkv2, (unsigned) sp, (unsigned) T), 128, 0, rst>>>(
-                            pQ, r_kq, r_ks, r_vq, r_vs, rRelTab, rSink, rSplit,
-                            (int) nh2, (int) nkv2, (int) hp.n_rel_ext, kv_cap[(size_t) il], is_swa ? 1 : 0, (int) hp.n_swa, r_pos0, kq_scale, sp);
+                        if (T == 1 && use_qsa_sparse) {
+                            k_attn_q8_gqa3_qsa_split<<<dim3((unsigned) nkv2, (unsigned) sp), 128, 0, rst>>>(
+                                pQ, r_kq, r_ks, r_vq, r_vs, rRelTab, rSink,
+                                rqs.d_sel, rqs.K_blocks, rSplit,
+                                (int) nh2, (int) nkv2, (int) hp.n_rel_ext, kv_cap[(size_t) il], r_pos0, kq_scale, sp);
+                        } else {
+                            k_attn_q8_gqa3_split<<<dim3((unsigned) nkv2, (unsigned) sp, (unsigned) T), 128, 0, rst>>>(
+                                pQ, r_kq, r_ks, r_vq, r_vs, rRelTab, rSink, rSplit,
+                                (int) nh2, (int) nkv2, (int) hp.n_rel_ext, kv_cap[(size_t) il], is_swa ? 1 : 0, (int) hp.n_swa, r_pos0, kq_scale, sp);
+                        }
                         k_attn_split_combine<<<dim3((unsigned) nh2, (unsigned) T), 128, 0, rst>>>(
                             rSplit, pGate, rAtt, (int) nh2, sp, r_pos0, is_swa ? 1 : 0, (int) hp.n_swa, (T <= 8) ? rAttXq : nullptr);
                         if (T <= 8) att_xq_r = rAttXq;
+                    } else if (use_qsa_sparse) {
+                        k_attn_q8_gqa3_qsa_pp_wmma<<<dim3((unsigned) nh2, (unsigned) ((T + 15) / 16)), 128, 29696, rst>>>(
+                            pQ, r_kq, r_ks, r_vq, r_vs, rRelTab, rSink, pGate, rAtt,
+                            rqs.d_sel, rqs.K_blocks,
+                            (int) nh2, (int) nkv2, (int) hp.n_rel_ext, kv_cap[(size_t) il], r_pos0, kq_scale, T);
                     } else {
                         k_attn_q8_gqa3_pp_wmma<<<dim3((unsigned) nh2, (unsigned) ((T + 15) / 16)), 128, 29184, rst>>>(
                             pQ, r_kq, r_ks, r_vq, r_vs, rRelTab, rSink, pGate, rAtt,
@@ -4108,9 +4415,20 @@ struct Engine {
                             ? (is_swa ? attn_split_t1_swa : attn_split_t1_full)
                             : (is_swa ? std::clamp((sm_count * 2) / std::max(1, (int) hp.n_head_kv * T), 4, 24)
                                       : std::clamp((sm_count * 16) / std::max(1, (int) hp.n_head_kv * T), 16, kAttnSplitMax)));
-                        k_attn_q8_gqa3_split<<<dim3((unsigned) hp.n_head_kv, (unsigned) sp, (unsigned) T), 128, 0, st>>>(
-                            pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, attn_split,
-                            (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il], is_swa ? 1 : 0, (int) hp.n_swa, pos0_d, kq_scale, sp);
+                        bool use_qsa_1g_t1 = false;
+                        if (!is_swa && qsa_st0.active && T == 1) {
+                            run_qsa_indexer(st, gemm, qsa_st0, m->qsa.dev0, il, in_q, ink_src, nullptr, (uint16_t*) escr, pos0_d, 1, (int) pos, use_qsa_1g_t1);
+                        }
+                        if (use_qsa_1g_t1) {
+                            k_attn_q8_gqa3_qsa_split<<<dim3((unsigned) hp.n_head_kv, (unsigned) sp), 128, 0, st>>>(
+                                pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink,
+                                qsa_st0.d_sel, qsa_st0.K_blocks, attn_split,
+                                (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il], pos0_d, kq_scale, sp);
+                        } else {
+                            k_attn_q8_gqa3_split<<<dim3((unsigned) hp.n_head_kv, (unsigned) sp, (unsigned) T), 128, 0, st>>>(
+                                pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, attn_split,
+                                (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il], is_swa ? 1 : 0, (int) hp.n_swa, pos0_d, kq_scale, sp);
+                        }
                         k_attn_split_combine<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
                             attn_split, pGate, att, (int) hp.n_head, sp, pos0_d, is_swa ? 1 : 0, (int) hp.n_swa, (T <= 8) ? xq : nullptr);
                         if (T <= 8) att_xq_ready = xq;
@@ -4120,12 +4438,22 @@ struct Engine {
                         // and fall back to k_attn_q8 on older non-WMMA GPUs.
                         static const int hip_pp_mode = []() {
                             const char* v = std::getenv("STRATA_INKLING2_HIP_PP_ATTN");
-                            if (!v || !*v || std::strcmp(v, "gqa3") == 0) return 0;
+                            if (!v || !*v || std::strcmp(v, "wmma") == 0) return 2;
+                            if (std::strcmp(v, "gqa3") == 0) return 0;
                             if (std::strcmp(v, "t32") == 0) return 1;
-                            if (std::strcmp(v, "wmma") == 0) return 2;
                             return 3;
                         }();
-                        if (!has_hip_wmma || hip_pp_mode == 3) {
+                        bool use_qsa_1g_pp = false;
+                        if (!is_swa && qsa_st0.active) {
+                            // Pass nullptr for r_f16q: 1-GPU project_preq(inv_src) overwrites act_bf16 (= f16_q) when inv_src != in_q!
+                            run_qsa_indexer(st, gemm, qsa_st0, m->qsa.dev0, il, in_q, ink_src, nullptr, (uint16_t*) escr, pos0_d, T, (int) pos, use_qsa_1g_pp);
+                        }
+                        if (use_qsa_1g_pp && has_hip_wmma) {
+                            k_attn_q8_gqa3_qsa_pp_wmma<<<dim3((unsigned) hp.n_head, (unsigned) ((T + 15) / 16)), 128, 29696, st>>>(
+                                pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, pGate, att,
+                                qsa_st0.d_sel, qsa_st0.K_blocks,
+                                (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il], pos0_d, kq_scale, T);
+                        } else if (!has_hip_wmma || hip_pp_mode == 3) {
                             k_attn_q8<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
                                 pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, pGate, att,
                                 (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il], is_swa ? 1 : 0, (int) hp.n_swa, pos0_d, kq_scale);
@@ -4227,7 +4555,50 @@ struct Engine {
                     pQ, kc[(size_t) il], vc[(size_t) il], rel_tab, sink, att,
                     (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il], is_swa ? 1 : 0, (int) hp.n_swa, pos0_d, kq_scale);
             }
-            if (prof_detail) { CK(cudaStreamSynchronize(st)); p_d_attn += ms_since(tp_d2); }
+                                if (qsa_teacher.active && !is_swa && kv_q8 && T >= 16) {
+                        const int fidx = qsa_teacher.full_idx(il);
+                        if (fidx >= 0) {
+                            const int n_tb = T / 4;
+                            if (n_tb > 0 && n_tb <= qsa_teacher.cap_tb) {
+                                k_qsa_mean4_f32_to_f16<<<(unsigned) n_tb, 256, 0, st>>>(ink_src, qsa_teacher.d_kmean, n_tb, (int) N);
+                                const size_t elems = (size_t) n_tb * (size_t) N;
+                                const size_t old_sz = qsa_teacher.k_mean_h[(size_t) fidx].size();
+                                qsa_teacher.k_mean_h[(size_t) fidx].resize(old_sz + elems);
+                                CK(cudaMemcpyAsync(qsa_teacher.k_mean_h[(size_t) fidx].data() + old_sz,
+                                                   qsa_teacher.d_kmean, elems * sizeof(uint16_t), cudaMemcpyDeviceToHost, st));
+                            }
+                            std::vector<int32_t> rows;
+                            for (int t = 0; t < T; ++t) {
+                                const int pq = (int) pos + t;
+                                const int seq_len_est = qsa_teacher.max_blocks * 4;
+                                if (pq >= 2048 && ((pq % 32 == 31) || (pq >= seq_len_est - 256 && (pq % 2 == 1)))) rows.push_back(t);
+                            }
+                            if (!rows.empty() && (int) rows.size() <= qsa_teacher.cap_m) {
+                                const int M = (int) rows.size();
+                                CK(cudaMemcpyAsync(qsa_teacher.d_qrows, rows.data(), (size_t) M * sizeof(int32_t), cudaMemcpyHostToDevice, st));
+                                k_qsa_gather_rows_f32_to_f16<<<(unsigned) M, 256, 0, st>>>(in_q, qsa_teacher.d_qrows, qsa_teacher.d_qfeat, M, (int) N);
+                                CK(cudaMemsetAsync(qsa_teacher.d_p_f32, 0, (size_t) M * (size_t) qsa_teacher.max_blocks * sizeof(float), st));
+                                k_qsa_teacher_targets<<<dim3((unsigned) M, (unsigned) hp.n_head), 128, 0, st>>>(
+                                    pQ, kq[(size_t) il], ks[(size_t) il], rel_tab, sink,
+                                    qsa_teacher.d_qrows, qsa_teacher.d_p_f32,
+                                    (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il],
+                                    (int) pos, kq_scale, qsa_teacher.max_blocks);
+                                const int64_t ptot = (int64_t) M * qsa_teacher.max_blocks;
+                                k_f32_to_f16<<<(unsigned) ((ptot + 255) / 256), 256, 0, st>>>(qsa_teacher.d_p_f32, (uint16_t*) qsa_teacher.d_p_f16, ptot);
+                                const size_t qold = qsa_teacher.q_feat_h[(size_t) fidx].size();
+                                qsa_teacher.q_feat_h[(size_t) fidx].resize(qold + (size_t) M * (size_t) N);
+                                CK(cudaMemcpyAsync(qsa_teacher.q_feat_h[(size_t) fidx].data() + qold,
+                                                   qsa_teacher.d_qfeat, (size_t) M * (size_t) N * sizeof(uint16_t), cudaMemcpyDeviceToHost, st));
+                                const size_t pold = qsa_teacher.p_tgt_h[(size_t) fidx].size();
+                                qsa_teacher.p_tgt_h[(size_t) fidx].resize(pold + (size_t) ptot);
+                                CK(cudaMemcpyAsync(qsa_teacher.p_tgt_h[(size_t) fidx].data() + pold,
+                                                   qsa_teacher.d_p_f16, (size_t) ptot * sizeof(uint16_t), cudaMemcpyDeviceToHost, st));
+                                for (int r : rows) qsa_teacher.q_pos_h[(size_t) fidx].push_back((int32_t) (pos + r));
+                                CK(cudaStreamSynchronize(st));
+                            }
+                        }
+                    }
+if (prof_detail) { CK(cudaStreamSynchronize(st)); p_d_attn += ms_since(tp_d2); }
             if (evp) cudaEventRecord(ev_t[il][3], st);
 
             const auto tp_d3 = Clock::now();
@@ -5237,6 +5608,13 @@ int run(int argc, char** argv) {
     std::string model_path;
     std::string draft_path;
     std::string tokens_str = "1,2";
+    std::string tokens_file;
+    std::string dump_qsa_dir;
+    std::string dump_qsa_manifest;
+    std::string qsa_indexer_path;
+    int qsa_budget = 2048;
+    int qsa_local = 256;
+    int qsa_sink = 16;
     std::string dump_logits_path;
     int max_ctx = 65536;
     int chunk = 0;
@@ -5269,6 +5647,13 @@ int run(int argc, char** argv) {
         else if (a == "--chunk" || a == "--prefill") chunk = std::atoi(next_arg());
         else if (a == "--max-new" || a == "-n") max_new = std::atoi(next_arg());
         else if (a == "--tokens") tokens_str = next_arg();
+        else if (a == "--tokens-file") tokens_file = next_arg();
+        else if (a == "--dump-qsa-teacher") dump_qsa_dir = next_arg();
+        else if (a == "--dump-qsa-manifest") dump_qsa_manifest = next_arg();
+        else if (a == "--qsa-indexer") qsa_indexer_path = next_arg();
+        else if (a == "--qsa-budget") qsa_budget = std::max(64, std::atoi(next_arg()));
+        else if (a == "--qsa-local") qsa_local = std::max(0, std::atoi(next_arg()));
+        else if (a == "--qsa-sink") qsa_sink = std::max(0, std::atoi(next_arg()));
         else if (a == "--expert-vram") expert_vram = std::atof(next_arg());
         else if (a == "--peer-device") peer_device = std::atoi(next_arg());
         else if (a == "--peer-reserve-mib") peer_reserve_mib = std::max(128, std::atoi(next_arg()));
@@ -5294,6 +5679,17 @@ int run(int argc, char** argv) {
     if (!load_model(model_path, m, err, peer_device, kv_q8)) {
         std::fprintf(stderr, "strata-inkling2: load failed: %s\n", err.c_str());
         return 1;
+    }
+    if (!qsa_indexer_path.empty()) {
+        m.qsa.budget_tokens = qsa_budget;
+        m.qsa.local_tokens = qsa_local;
+        m.qsa.sink_tokens = qsa_sink;
+        int cur_dev_q = 0;
+        cudaGetDevice(&cur_dev_q);
+        if (!m.qsa.load_file(qsa_indexer_path, cur_dev_q, peer_device, err)) {
+            std::fprintf(stderr, "strata-inkling2: QSA indexer load failed: %s\n", err.c_str());
+            return 1;
+        }
     }
     std::unique_ptr<DsparkModel> dm;
     std::unique_ptr<DsparkEngine> dspark;
@@ -5608,6 +6004,42 @@ int run(int argc, char** argv) {
         return 0;
     }
 
+    if (!dump_qsa_dir.empty() && !dump_qsa_manifest.empty()) {
+        std::ifstream mf(dump_qsa_manifest);
+        std::vector<std::string> files;
+        std::string line;
+        while (std::getline(mf, line)) {
+            if (!line.empty()) files.push_back(line);
+        }
+        std::fprintf(stderr, "strata-inkling2: QSA teacher dump mode (%zu sequences -> %s)\n", files.size(), dump_qsa_dir.c_str());
+        for (size_t si = 0; si < files.size(); ++si) {
+            std::ifstream tf(files[si]);
+            std::string content((std::istreambuf_iterator<char>(tf)), std::istreambuf_iterator<char>());
+            std::vector<int32_t> seq = parse_id_list(content);
+            if (seq.empty()) continue;
+            if (!E.qsa_teacher.active) E.qsa_teacher.init(m.hp, (int) seq.size());
+            E.reset_state();
+            E.qsa_teacher.clear_seq();
+            const auto t0 = Clock::now();
+            for (size_t off = 0; off < seq.size(); off += (size_t) chunk) {
+                const int tc = (int) std::min<size_t>((size_t) chunk, seq.size() - off);
+                const bool is_last = (off + (size_t) tc == seq.size());
+                E.forward(seq.data() + off, tc, false, nullptr, false, false, 0, nullptr, is_last);
+            }
+            const double ms = ms_since(t0);
+            char outp[512];
+            std::snprintf(outp, sizeof(outp), "%s/seq_%03zu.qsat", dump_qsa_dir.c_str(), si);
+            E.qsa_teacher.save(outp);
+            std::fprintf(stderr, "  [%zu/%zu] %s (%zu tok) -> %s in %.1f ms (%.0f t/s)\n",
+                         si + 1, files.size(), files[si].c_str(), seq.size(), outp, ms, (double) seq.size() * 1000.0 / ms);
+        }
+        return 0;
+    }
+
+    if (!tokens_file.empty()) {
+        std::ifstream tf(tokens_file);
+        tokens_str.assign((std::istreambuf_iterator<char>(tf)), std::istreambuf_iterator<char>());
+    }
     std::vector<int32_t> prompt = parse_id_list(tokens_str);
     if (prompt.empty()) prompt = {1};
 
