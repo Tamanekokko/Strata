@@ -10,8 +10,9 @@
 [![Engine](https://img.shields.io/badge/Engine-strata--inkling2-2563eb)](docs/INKLING2.md)
 [![Verified GPU](https://img.shields.io/badge/Verified-AMD%20RX%209060%20XT%2016GB%20%281x%20%26%202x%20TP%3D2%29-ed1c24)](#benchmarks)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Discussions](https://img.shields.io/badge/Discussions-Compatibility%20%26%20Benchmarks-6e5494)](https://github.com/Tamanekokko/Strata/discussions/1)
 
-[Highlights](#highlights) · [QSA Sparse Attention](#qsa-qwen-sparse-attention) · [Benchmarks](#benchmarks) · [Architecture](#amd-rdna4-native-architecture) · [Build](#build-from-source) · [Quick Start](#quick-start)
+[Highlights](#highlights) · [QSA Sparse Attention](#qsa-qwen-sparse-attention) · [Benchmarks](#benchmarks) · [Architecture](#amd-rdna4-native-architecture) · [Build](#build-from-source) · [Quick Start](#quick-start) · [Community & Reports](#community--reports)
 
 </div>
 
@@ -201,6 +202,12 @@ modal volume get inkling2-qsa-data /inkling2-qsa-indexer-v3.bin ./inkling2-qsa-i
 - `STRATA_NO_TP_MOE=1` — Fall back from expert-internal TP=2 (`576+576`) to 64+64 EP split
 - `STRATA_NO_CTRL_F16=1` — Keep loop controllers in F32 instead of FP16
 - `STRATA_EV_PROF=1` — Print zero-host-sync per-stage GPU timing breakdown (with `STRATA_NO_TP_GRAPH=1`)
+
+## Community & Reports
+
+- **Hardware Compatibility & Benchmarks** — Tested on your AMD Radeon GPU (1-GPU or multi-GPU)? Share your setup and `t/s` results in the [Compatibility & Benchmark Reports thread](https://github.com/Tamanekokko/Strata/discussions/1) on GitHub Discussions. Both working and non-working reports help.
+- **Bug Reports & Build Failures** — Hit a reproducible crash, output bug, or ROCm/HIP build error? Open an [Issue](https://github.com/Tamanekokko/Strata/issues/new/choose) using the runtime or build failure form.
+- **Questions & General Discussion** — Use [GitHub Discussions (Q&A)](https://github.com/Tamanekokko/Strata/discussions/categories/q-a).
 
 ## License
 

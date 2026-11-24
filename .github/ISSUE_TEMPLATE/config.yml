@@ -1,5 +1,8 @@
-blank_issues_enabled: true
+blank_issues_enabled: false
 contact_links:
-  - name: Troubleshooting and known issues
-    url: https://github.com/Niko1221/Strata/blob/main/docs/TROUBLESHOOTING.md
-    about: Symptom-to-fix table for crashes, out of memory, hangs, and port problems.
+  - name: Hardware Compatibility & Benchmark Reports
+    url: https://github.com/Tamanekokko/Strata/discussions/1
+    about: Share your Radeon / ROCm test results, working setups, and t/s benchmarks (1-GPU & multi-GPU).
+  - name: Q&A and Usage Questions
+    url: https://github.com/Tamanekokko/Strata/discussions/categories/q-a
+    about: Ask questions about setup, flags, QSA, or multi-GPU configuration.

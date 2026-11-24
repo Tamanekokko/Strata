@@ -1,0 +1,47 @@
+name: Build failure (ROCm / HIP)
+description: Report a CMake or HIP compilation/linking error when building strata-inkling2
+title: "[Build] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form if building `strata-inkling2` with ROCm/HIP fails.
+        English and Japanese are both welcome / 日本語での報告も歓迎です。
+  - type: input
+    id: target
+    attributes:
+      label: Target GPU architecture (AMDGPU_TARGETS)
+      placeholder: "e.g., gfx1200 / gfx1201 / gfx1100"
+    validations:
+      required: true
+  - type: input
+    id: toolchain
+    attributes:
+      label: ROCm version, hipcc version, CMake version, and OS
+      description: Check with `hipcc --version` and `cmake --version`.
+      placeholder: "e.g., ROCm 7.x / 10.1.0, CMake 3.28, Ubuntu 24.04"
+    validations:
+      required: true
+  - type: input
+    id: commit
+    attributes:
+      label: Git commit
+      description: Output of `git rev-parse --short HEAD`
+      placeholder: "e.g., 7f03946"
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: CMake & build commands used
+      render: bash
+    validations:
+      required: true
+  - type: textarea
+    id: error_log
+    attributes:
+      label: Compiler / linker error output
+      render: text
+    validations:
+      required: true
