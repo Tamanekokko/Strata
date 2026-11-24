@@ -1359,17 +1359,36 @@ struct Engine {
                 use_qsa_sparse = true;
             }
         } else {
-            if ((p0_host & 3) == 0 && (T >= 4)) {
-                const int n_tb = T >> 2;
-                k_qsa_mean4_f32_to_f16<<<(unsigned) n_tb, 256, 0, rst>>>(r_ink, qs.d_kmean, n_tb, N);
+            // Handle arbitrary p0_host alignment and any T >= 1 (critical for multi-turn / prefix-cache resume)
+            const int head_rem = p0_host & 3;
+            int idx = 0;
+            if (head_rem > 0) {
+                const int need = 4 - head_rem;
+                const int take = std::min(T, need);
+                CK(cudaMemcpyAsync(qs.k_tail[(size_t) fidx] + (size_t) head_rem * N, r_ink,
+                                   (size_t) take * N * sizeof(float), cudaMemcpyDeviceToDevice, rst));
+                idx += take;
+                if (head_rem + take == 4) {
+                    k_qsa_mean4_f32_to_f16<<<1, 256, 0, rst>>>(qs.k_tail[(size_t) fidx], qs.d_kmean, 1, N);
+                    rgemm.f16((const uint16_t*) qs.d_kmean, QL.w_k, qs.d_kraw, 1, m->qsa.d_idx, N);
+                    k_qsa_k_norm_rope<<<1, 128, 0, rst>>>(
+                        qs.d_kraw, QL.k_norm_w, qs.k_comp[(size_t) fidx], p0_host >> 2, 1, m->qsa.rope_theta);
+                }
+            }
+            const int rem_T = T - idx;
+            const int n_tb = rem_T >> 2;
+            if (n_tb > 0) {
+                const int b0 = (p0_host + idx) >> 2;
+                k_qsa_mean4_f32_to_f16<<<(unsigned) n_tb, 256, 0, rst>>>(r_ink + (size_t) idx * N, qs.d_kmean, n_tb, N);
                 rgemm.f16((const uint16_t*) qs.d_kmean, QL.w_k, qs.d_kraw, n_tb, m->qsa.d_idx, N);
                 k_qsa_k_norm_rope<<<(unsigned) n_tb, 128, 0, rst>>>(
-                    qs.d_kraw, QL.k_norm_w, qs.k_comp[(size_t) fidx], p0_host >> 2, n_tb, m->qsa.rope_theta);
-                const int rem = T & 3;
-                if (rem > 0) {
-                    CK(cudaMemcpyAsync(qs.k_tail[(size_t) fidx], r_ink + (size_t) (n_tb * 4) * N,
-                                       (size_t) rem * N * sizeof(float), cudaMemcpyDeviceToDevice, rst));
-                }
+                    qs.d_kraw, QL.k_norm_w, qs.k_comp[(size_t) fidx], b0, n_tb, m->qsa.rope_theta);
+                idx += n_tb * 4;
+            }
+            const int tail_rem = T - idx;
+            if (tail_rem > 0) {
+                CK(cudaMemcpyAsync(qs.k_tail[(size_t) fidx], r_ink + (size_t) idx * N,
+                                   (size_t) tail_rem * N * sizeof(float), cudaMemcpyDeviceToDevice, rst));
             }
             static const bool qsa_decode_only = (std::getenv("STRATA_QSA_DECODE_ONLY") != nullptr);
             if (!qsa_decode_only && p0_host + T > m->qsa.budget_tokens) {
@@ -1887,6 +1906,9 @@ struct Engine {
             if (kv_q8) total += (tp ? 2 : 1) * (cap * kv_d * 2 + cap * nh_kv * sizeof(__half) * 2);
             else total += cap * kv_d * sizeof(__half) * 2;
         }
+        const size_t qsa_tail_bytes = qsa_st0.active ? ((size_t) 4 * (size_t) m->qsa.n_embd * sizeof(float)) : 0;
+        if (qsa_st0.active) total += (size_t) qsa_st0.n_full * qsa_tail_bytes;
+        if (tp && qsa_st1.active) total += (size_t) qsa_st1.n_full * qsa_tail_bytes;
         StateCheckpoint cp;
         cp.tokens = tokens;
         cp.data.resize(total);
@@ -1917,6 +1939,9 @@ struct Engine {
                 pull(vc[(size_t) il], cap * kv_d * sizeof(__half), st);
             }
         }
+        if (qsa_st0.active) {
+            for (int f = 0; f < qsa_st0.n_full; ++f) pull(qsa_st0.k_tail[(size_t) f], qsa_tail_bytes, st);
+        }
         if (tp) {
             CK(cudaSetDevice(peer.dev));
             pull(peer.conv_hist_pool, peer_conv_bytes, peer.st);
@@ -1929,6 +1954,9 @@ struct Engine {
                     pull(peer.ks[(size_t) il], cap * nh_kv * sizeof(__half), peer.st);
                     pull(peer.vs[(size_t) il], cap * nh_kv * sizeof(__half), peer.st);
                 }
+            }
+            if (qsa_st1.active) {
+                for (int f = 0; f < qsa_st1.n_full; ++f) pull(qsa_st1.k_tail[(size_t) f], qsa_tail_bytes, peer.st);
             }
             CK(cudaStreamSynchronize(peer.st));
             CK(cudaSetDevice(peer.primary_dev));
@@ -1971,6 +1999,10 @@ struct Engine {
                 push(vc[(size_t) il], cap * kv_d * sizeof(__half), st);
             }
         }
+        const size_t qsa_tail_bytes = qsa_st0.active ? ((size_t) 4 * (size_t) m->qsa.n_embd * sizeof(float)) : 0;
+        if (qsa_st0.active) {
+            for (int f = 0; f < qsa_st0.n_full; ++f) push(qsa_st0.k_tail[(size_t) f], qsa_tail_bytes, st);
+        }
         if (tp) {
             CK(cudaSetDevice(peer.dev));
             push(peer.conv_hist_pool, peer_conv_bytes, peer.st);
@@ -1983,6 +2015,9 @@ struct Engine {
                     push(peer.ks[(size_t) il], cap * nh_kv * sizeof(__half), peer.st);
                     push(peer.vs[(size_t) il], cap * nh_kv * sizeof(__half), peer.st);
                 }
+            }
+            if (qsa_st1.active) {
+                for (int f = 0; f < qsa_st1.n_full; ++f) push(qsa_st1.k_tail[(size_t) f], qsa_tail_bytes, peer.st);
             }
             CK(cudaStreamSynchronize(peer.st));
             CK(cudaSetDevice(peer.primary_dev));
